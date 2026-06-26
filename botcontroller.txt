@@ -34,9 +34,9 @@ local Controller = {
 ENV.PealzBotController = Controller
 
 -- [[ CONFIG ]]
-local OWNER_USER_ID = 9763171531
-local OWNER_NAME = "0pealz"
-local OWNER_DISPLAY_NAME = "pealz"
+local OWNER_USER_ID = 4091480137
+local OWNER_NAME = "chin_guun50"
+local OWNER_DISPLAY_NAME = "skz"
 local STRICT_OWNER_NAME_CHECK = true
 
 local BOT_KEYWORD = "TomazDev"
