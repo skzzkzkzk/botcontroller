@@ -1,0 +1,4440 @@
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local TextChatService = game:GetService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+
+local ENV = getgenv and getgenv() or _G
+
+if ENV.PealzBotController and ENV.PealzBotController.stop then
+    pcall(function()
+        ENV.PealzBotController.stop()
+    end)
+end
+
+local originalFallenPartsDestroyHeight = workspace.FallenPartsDestroyHeight
+local originalGravity = workspace.Gravity
+
+local Controller = {
+    running = true,
+    connections = {},
+    threads = {},
+    chatQueue = {},
+    chatWorkerRunning = false,
+    previousOnIncomingMessage = nil,
+    incomingMessageHandler = nil,
+}
+
+ENV.PealzBotController = Controller
+
+-- [[ CONFIG ]]
+local OWNER_USER_ID = 9763171531
+local OWNER_NAME = "0pealz"
+local OWNER_DISPLAY_NAME = "pealz"
+local STRICT_OWNER_NAME_CHECK = true
+
+local BOT_KEYWORD = "TomazDev"
+local BOT_NAME_PREFIXES = {
+    "TomazDevHate",
+    "TomazDev",
+}
+local COMMAND_PREFIX = "."
+local COMMAND_PREFIXES = {".", ","}
+local COMMAND_BUS_FILE = "PealzBotCommandBus.json"
+local COMMAND_BUS_POLL_INTERVAL = 0.25
+
+local REMOTE_CONTROL_ENABLED = true
+local REMOTE_CONTROL_BASE_URL = "https://cipher.pink/bots/api"
+local REMOTE_CONTROL_KEY = "brody"
+local REMOTE_POLL_INTERVAL = 1.0
+local REMOTE_HEARTBEAT_INTERVAL = 5
+local SCRIPT_VERSION = "2026.05.25-build-overhaul"
+
+local CHAT_SEND_INTERVAL = 1.15
+local CHAT_MAX_LENGTH = 170
+local CHAT_QUEUE_LIMIT = 8
+
+local POSITION_UPDATE_INTERVAL = 0.03
+local FOLLOW_DISTANCE = 3
+local FOLLOW_SIDE_SPACING = 4
+local FOLLOW_ROW_DEPTH = 3.5
+local FOLLOW_REPATH_INTERVAL = 0.75
+local FOLLOW_WALK_STOP_DISTANCE = 2.4
+local FOLLOW_STUCK_DISTANCE = 9
+local FOLLOW_STUCK_SECONDS = 3.5
+local FOLLOW_TELEPORT_DISTANCE = 75
+local DEFAULT_LINE_SPACING = 5
+local DEFAULT_LINE_DISTANCE = 9
+local DEFAULT_CIRCLE_RADIUS = 10
+local DEFAULT_TOWER_SPACING = 4.2
+local DEFAULT_TOWER_DISTANCE = 5
+local DEFAULT_ORBIT_RADIUS = 11
+local DEFAULT_ORBIT_SPEED = 1.4
+local DEFAULT_SCATTER_RADIUS = 15
+-- Generic params shared by the extra shape formations (.square .grid .triangle
+-- .diamond .cross .wedge .arc .wall .pyramid .zigzag .star .spiral .heart).
+local DEFAULT_SHAPE_RADIUS = 12
+local DEFAULT_SHAPE_SPACING = 4
+local DEFAULT_SHAPE_DISTANCE = 12
+
+local AUTO_DONATE_ENABLED = true
+local AUTO_DONATE_MIN_TIME = 100
+local AUTO_DONATE_COOLDOWN = 8
+
+local FOCUS_HEARTBEAT_ENABLED = true
+local FOCUS_HEARTBEAT_INTERVAL = 5
+local ENABLE_AGGRESSIVE_ANTI_AFK = true
+local ANTI_AFK_INPUT_INTERVAL = 45
+local ANTI_AFK_CHARACTER_NUDGE_INTERVAL = 240
+
+local ENABLE_ALWAYS_ON_ANTIS = true
+local ANTI_FAST_INTERVAL = 0.1
+local ANTI_SLOW_INTERVAL = 0.5
+local ANTI_FLING_SPEED_CAP = 200
+local ANTI_FARLANDS_LIMIT = 10000
+local ANTI_VOID_Y = -100
+local ANTI_GRAVITY = 196.2
+local ANTI_RESTORE_HEALTH = true
+
+local ENABLE_POTATO_MODE = true
+local HIDE_TEXTURES = true
+local HIDE_PARTICLES = true
+
+local state = {
+    mode = "idle",
+    hiddenDonations = false,
+    noclip = false,
+    selfNoclip = false,
+    resetting = false,
+    spacing = DEFAULT_LINE_SPACING,
+    lineDistance = DEFAULT_LINE_DISTANCE,
+    circleRadius = DEFAULT_CIRCLE_RADIUS,
+    towerSpacing = DEFAULT_TOWER_SPACING,
+    towerDistance = DEFAULT_TOWER_DISTANCE,
+    orbitRadius = DEFAULT_ORBIT_RADIUS,
+    orbitSpeed = DEFAULT_ORBIT_SPEED,
+    scatterRadius = DEFAULT_SCATTER_RADIUS,
+    shapeRadius = DEFAULT_SHAPE_RADIUS,
+    shapeSpacing = DEFAULT_SHAPE_SPACING,
+    shapeDistance = DEFAULT_SHAPE_DISTANCE,
+    partying = false,
+    partyToken = 0,
+    spinUntil = 0,
+    targetPlayer = nil,
+    lastCheerAt = 0,
+    lastDonateAt = 0,
+    lastFollowMoveTo = 0,
+    followStuckSince = nil,
+    followStuckCheckPos = nil,
+    followStuckCheckDistance = nil,
+    lastCommandAt = {},
+    seenBusIds = {},
+    lastBusPublishAt = {},
+    remoteSynced = false,
+    remoteLastSeq = nil,
+    remoteUnavailableNotified = false,
+}
+
+local noclipOriginalCollisions = setmetatable({}, {__mode = "k"})
+
+local function restoreNoclipCollisions()
+    for part, originalValue in pairs(noclipOriginalCollisions) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = originalValue
+            end)
+        end
+
+        noclipOriginalCollisions[part] = nil
+    end
+end
+
+local function track(conn)
+    if conn then
+        table.insert(Controller.connections, conn)
+    end
+    return conn
+end
+
+local function trackThread(threadRef)
+    if threadRef then
+        table.insert(Controller.threads, threadRef)
+    end
+    return threadRef
+end
+
+function Controller.stop()
+    Controller.running = false
+    state.mode = "idle"
+    state.noclip = false
+    Controller.chatQueue = {}
+    Controller.chatWorkerRunning = false
+
+    restoreNoclipCollisions()
+
+    pcall(function()
+        TextChatService.OnIncomingMessage = nil
+    end)
+
+    pcall(function()
+        workspace.FallenPartsDestroyHeight = originalFallenPartsDestroyHeight
+    end)
+
+    pcall(function()
+        workspace.Gravity = originalGravity
+    end)
+
+    Controller.incomingMessageHandler = nil
+    Controller.previousOnIncomingMessage = nil
+
+    for i, conn in ipairs(Controller.connections) do
+        pcall(function()
+            conn:Disconnect()
+        end)
+        Controller.connections[i] = nil
+    end
+
+    for i, threadRef in ipairs(Controller.threads) do
+        pcall(function()
+            task.cancel(threadRef)
+        end)
+        Controller.threads[i] = nil
+    end
+
+    if ENV.PealzBotController == Controller then
+        ENV.PealzBotController = nil
+    end
+end
+
+local function notify(text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Pealz Bots",
+            Text = tostring(text),
+            Duration = 4,
+        })
+    end)
+end
+
+local function sameText(a, b)
+    return string.lower(tostring(a or "")) == string.lower(tostring(b or ""))
+end
+
+local function normalizeName(value)
+    value = string.lower(tostring(value or ""))
+    value = string.gsub(value, "%s+", "")
+    value = string.gsub(value, "_", "")
+    return value
+end
+
+local function isBotName(value)
+    local normalized = normalizeName(value)
+    if normalized == "" then
+        return false
+    end
+
+    for _, prefix in ipairs(BOT_NAME_PREFIXES) do
+        local normalizedPrefix = normalizeName(prefix)
+        if string.sub(normalized, 1, #normalizedPrefix) == normalizedPrefix then
+            return true
+        end
+    end
+
+    return string.find(normalized, normalizeName(BOT_KEYWORD), 1, true) ~= nil
+end
+
+local isBot = isBotName(LocalPlayer.Name) or isBotName(LocalPlayer.DisplayName)
+
+local function isOwnerPlayer(player)
+    if not player or player.UserId ~= OWNER_USER_ID then
+        return false
+    end
+
+    -- UserId is the authority. Name/display checks are intentionally not used
+    -- for incoming chat because some clients receive TextSource before all
+    -- Player display metadata is reliable.
+    return true
+end
+
+local function getSpeakerUserId(speaker)
+    if type(speaker) == "number" then
+        return speaker
+    end
+
+    return speaker and speaker.UserId or nil
+end
+
+local function isOwnerSpeaker(speaker)
+    return getSpeakerUserId(speaker) == OWNER_USER_ID
+end
+
+local isOwnerAccount = LocalPlayer.UserId == OWNER_USER_ID or sameText(LocalPlayer.Name, OWNER_NAME)
+local shouldOptimizeLocalClient = ENABLE_POTATO_MODE and not isOwnerAccount
+
+local function getOwnerPlayer()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isOwnerPlayer(player) then
+            return player
+        end
+    end
+    return nil
+end
+
+local function isBotPlayer(player)
+    return player ~= nil and (isBotName(player.Name) or isBotName(player.DisplayName))
+end
+
+local function getBotRoster()
+    local roster = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isBotPlayer(player) then
+            table.insert(roster, player)
+        end
+    end
+
+    table.sort(roster, function(a, b)
+        if a.UserId == b.UserId then
+            return a.Name < b.Name
+        end
+        return a.UserId < b.UserId
+    end)
+
+    return roster
+end
+
+local function getLocalBotIndex(roster)
+    for index, player in ipairs(roster) do
+        if player == LocalPlayer or player.UserId == LocalPlayer.UserId then
+            return index
+        end
+    end
+    return nil
+end
+
+local function getRoot(player)
+    local character = player and player.Character
+    return character and character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid(player)
+    local character = player and player.Character
+    return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+local function setProp(obj, prop, val)
+    pcall(function()
+        obj[prop] = val
+    end)
+end
+
+local function setHiddenProp(obj, prop, val)
+    if sethiddenproperty then
+        pcall(sethiddenproperty, obj, prop, val)
+    end
+end
+
+local function safeTeleport(cf)
+    local root = getRoot(LocalPlayer)
+    local humanoid = getHumanoid(LocalPlayer)
+
+    if not root or not humanoid or humanoid.Health <= 0 then
+        return
+    end
+
+    pcall(function()
+        humanoid.Sit = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = cf
+    end)
+end
+
+local function clampNumber(value, fallback, minValue, maxValue)
+    local number = tonumber(value)
+    if not number then
+        return fallback
+    end
+    return math.clamp(number, minValue, maxValue)
+end
+
+local function splitCommand(message)
+    local parts = {}
+    for token in string.gmatch(tostring(message or ""), "%S+") do
+        table.insert(parts, token)
+    end
+    return parts
+end
+
+local function getCommandPrefix(message)
+    message = tostring(message or "")
+
+    for _, prefix in ipairs(COMMAND_PREFIXES) do
+        if string.sub(message, 1, #prefix) == prefix then
+            return prefix
+        end
+    end
+
+    return nil
+end
+
+local function getTextChannels(timeout)
+    local textChannels = TextChatService:FindFirstChild("TextChannels")
+    if textChannels then
+        return textChannels
+    end
+
+    local ok, result = pcall(function()
+        return TextChatService:WaitForChild("TextChannels", timeout or 5)
+    end)
+
+    return ok and result or nil
+end
+
+local function getGeneralChannel(timeout)
+    local textChannels = getTextChannels(timeout)
+    if not textChannels then
+        return nil
+    end
+
+    local generalChannel = textChannels:FindFirstChild("RBXGeneral")
+    if generalChannel then
+        return generalChannel
+    end
+
+    local ok, result = pcall(function()
+        return textChannels:WaitForChild("RBXGeneral", timeout or 5)
+    end)
+
+    return ok and result or nil
+end
+
+-- [[ OPTIMIZATION ]]
+local function optimizeLighting()
+    if not shouldOptimizeLocalClient then
+        return
+    end
+
+    if setfpscap then
+        pcall(setfpscap, 15)
+    end
+
+    pcall(function()
+        UserSettings():GetService("UserGameSettings").SavedQualityLevel = Enum.SavedQualitySetting.QualityLevel1
+    end)
+
+    setProp(Lighting, "GlobalShadows", false)
+    setProp(Lighting, "FogEnd", 9e9)
+    setProp(Lighting, "Brightness", 2)
+    setProp(Lighting, "ClockTime", 14)
+    setProp(Lighting, "Ambient", Color3.fromRGB(255, 255, 255))
+    setProp(Lighting, "OutdoorAmbient", Color3.fromRGB(255, 255, 255))
+
+    for _, effect in ipairs(Lighting:GetChildren()) do
+        if effect:IsA("PostEffect") then
+            setProp(effect, "Enabled", false)
+        elseif effect:IsA("Atmosphere") then
+            setProp(effect, "Density", 0)
+            setProp(effect, "Haze", 0)
+            setProp(effect, "Glare", 0)
+        elseif effect:IsA("Clouds") then
+            setProp(effect, "Enabled", false)
+            setProp(effect, "Cover", 0)
+            setProp(effect, "Density", 0)
+        end
+    end
+
+    local terrain = workspace:FindFirstChildOfClass("Terrain")
+    if terrain then
+        setProp(terrain, "WaterWaveSize", 0)
+        setProp(terrain, "WaterWaveSpeed", 0)
+        setProp(terrain, "WaterReflectance", 0)
+        setProp(terrain, "WaterTransparency", 1)
+        setProp(terrain, "Decoration", false)
+        setHiddenProp(terrain, "Decoration", false)
+    end
+end
+
+local function optimizeInstance(instance)
+    if not shouldOptimizeLocalClient then
+        return
+    end
+
+    if instance:IsA("BasePart") then
+        setProp(instance, "Material", Enum.Material.SmoothPlastic)
+        setProp(instance, "Reflectance", 0)
+        setProp(instance, "CastShadow", false)
+
+        if instance:IsA("MeshPart") then
+            setProp(instance, "TextureID", "")
+        end
+    elseif HIDE_TEXTURES and (instance:IsA("Decal") or instance:IsA("Texture")) then
+        setProp(instance, "Transparency", 1)
+    elseif HIDE_TEXTURES and instance:IsA("SurfaceAppearance") then
+        setProp(instance, "ColorMap", "")
+        setProp(instance, "MetalnessMap", "")
+        setProp(instance, "NormalMap", "")
+        setProp(instance, "RoughnessMap", "")
+    elseif HIDE_PARTICLES and (instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam")) then
+        setProp(instance, "Enabled", false)
+    end
+end
+
+-- Track already-optimized instances so re-sweeps stay O(new-instances) instead
+-- of O(workspace). Weak keys so destroyed parts don't leak references.
+local optimizedInstances = setmetatable({}, {__mode = "k"})
+
+local function optimizeInstanceOnce(instance)
+    if optimizedInstances[instance] then
+        return
+    end
+    optimizedInstances[instance] = true
+    optimizeInstance(instance)
+end
+
+-- Some servers replicate Particle/Trail/Beam.Enabled = true on a loop, undoing
+-- our optimization. Bind property-change listeners so reverts get re-applied
+-- instantly instead of waiting for the next re-sweep.
+local function pinOptimizationProperties(instance)
+    if not HIDE_PARTICLES then
+        return
+    end
+
+    if instance:IsA("ParticleEmitter") or instance:IsA("Trail") or instance:IsA("Beam") then
+        track(instance:GetPropertyChangedSignal("Enabled"):Connect(function()
+            if instance.Enabled then
+                setProp(instance, "Enabled", false)
+            end
+        end))
+    elseif HIDE_TEXTURES and (instance:IsA("Decal") or instance:IsA("Texture")) then
+        track(instance:GetPropertyChangedSignal("Transparency"):Connect(function()
+            if instance.Transparency ~= 1 then
+                setProp(instance, "Transparency", 1)
+            end
+        end))
+    end
+end
+
+local function optimizeInstanceFull(instance)
+    optimizeInstanceOnce(instance)
+    pinOptimizationProperties(instance)
+end
+
+if shouldOptimizeLocalClient then
+    trackThread(task.spawn(function()
+        optimizeLighting()
+
+        local descendants = workspace:GetDescendants()
+        for index, instance in ipairs(descendants) do
+            if not Controller.running then
+                break
+            end
+
+            optimizeInstanceFull(instance)
+
+            if index % 250 == 0 then
+                task.wait()
+            end
+        end
+    end))
+
+    track(workspace.DescendantAdded:Connect(function(instance)
+        task.defer(optimizeInstanceFull, instance)
+    end))
+
+    -- Re-sweep loop. Catches anything the listeners missed (e.g. brand-new
+    -- effect classes, server-replicated Material reverts on BaseParts, lighting
+    -- effects that get added later). Runs every 25s; cheap because already-
+    -- processed instances short-circuit in optimizeInstanceOnce.
+    trackThread(task.spawn(function()
+        while Controller.running do
+            task.wait(25)
+            if not Controller.running then
+                break
+            end
+
+            pcall(optimizeLighting)
+
+            local descendants = workspace:GetDescendants()
+            for index, instance in ipairs(descendants) do
+                if not Controller.running then
+                    break
+                end
+                optimizeInstanceFull(instance)
+                if index % 400 == 0 then
+                    task.wait()
+                end
+            end
+        end
+    end))
+
+    -- Lighting children added later (Atmosphere, Clouds, ColorCorrection that
+    -- the game might spawn after load) also need to be tamed.
+    track(Lighting.ChildAdded:Connect(function()
+        task.defer(optimizeLighting)
+    end))
+end
+
+-- [[ OWNER QUALITY RESTORE ]]
+-- The optimization block above is gated behind `not isOwnerAccount`, so it
+-- never RUNS on 0pealz. But Roblox PERSISTS SavedQualityLevel and the FPS cap
+-- to disk (GlobalBasicSettings) — so if an earlier/buggy build (or a manual
+-- toggle) ever lowered them, 0pealz keeps loading at QualityLevel1 even though
+-- this script no longer touches it. We can't "remember" the old value, so we
+-- actively restore sane owner defaults: automatic quality + uncapped FPS. The
+-- bots are unaffected (they're not the owner) and still get full optimization.
+if isOwnerAccount then
+    trackThread(task.spawn(function()
+        pcall(function()
+            local ugs = UserSettings():GetService("UserGameSettings")
+            ugs.SavedQualityLevel = Enum.SavedQualitySetting.Automatic
+        end)
+        -- Uncap FPS if a previous run pinned it to 15. setfpscap(0) = unlimited
+        -- in essentially every executor (do NOT use a finite number — that
+        -- would *cap* a high-refresh display instead of uncapping it).
+        if setfpscap then
+            pcall(setfpscap, 0)
+        end
+    end))
+end
+
+-- [[ CHAT ]]
+local function sendChatMessageNow(msg)
+    msg = string.sub(tostring(msg or ""), 1, CHAT_MAX_LENGTH)
+    if msg == "" then
+        return false
+    end
+
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local generalChannel = getGeneralChannel(5)
+        if generalChannel then
+            local ok = pcall(function()
+                generalChannel:SendAsync(msg)
+            end)
+
+            if ok then
+                return true
+            end
+        end
+    end
+
+    local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    local sayMessageRequest = chatEvents and chatEvents:FindFirstChild("SayMessageRequest")
+
+    if sayMessageRequest then
+        return pcall(function()
+            sayMessageRequest:FireServer(msg, "All")
+        end)
+    end
+
+    return false
+end
+
+local function queueChat(msg, priority)
+    if #Controller.chatQueue >= CHAT_QUEUE_LIMIT then
+        if priority then
+            table.remove(Controller.chatQueue, #Controller.chatQueue)
+        else
+            return false
+        end
+    end
+
+    if priority then
+        table.insert(Controller.chatQueue, 1, tostring(msg or ""))
+    else
+        table.insert(Controller.chatQueue, tostring(msg or ""))
+    end
+
+    if Controller.chatWorkerRunning then
+        return true
+    end
+
+    Controller.chatWorkerRunning = true
+
+    trackThread(task.spawn(function()
+        while Controller.running and #Controller.chatQueue > 0 do
+            local nextMsg = table.remove(Controller.chatQueue, 1)
+            sendChatMessageNow(nextMsg)
+            task.wait(CHAT_SEND_INTERVAL)
+        end
+
+        Controller.chatWorkerRunning = false
+    end))
+
+    return true
+end
+
+local function sendPriorityChat(msg)
+    if sendChatMessageNow(msg) then
+        return true
+    end
+
+    return queueChat(msg, true)
+end
+
+local function displayLocalMessage(text, color)
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        local generalChannel = getGeneralChannel(1)
+        if generalChannel then
+            local ok = pcall(function()
+                local colorHex = (color or Color3.fromRGB(80, 220, 120)):ToHex()
+                generalChannel:DisplaySystemMessage(string.format("<font color='#%s'>%s</font>", colorHex, tostring(text)))
+            end)
+
+            if ok then
+                return true
+            end
+        end
+    end
+
+    notify(text)
+    return false
+end
+
+-- [[ ALWAYS-ON ANTIS - Pealzware style ]]
+local plr = LocalPlayer
+local playerGui = plr:WaitForChild("PlayerGui")
+local antiConnections = {}
+local antiVoidEnabled = true
+local antiGravityEnabled = true
+local originalDestroyHeight = originalFallenPartsDestroyHeight
+local stashRunning = false
+local _flingInProgress = false
+
+local function setAntiConnection(name, conn)
+    if antiConnections[name] then
+        pcall(function()
+            antiConnections[name]:Disconnect()
+        end)
+    end
+
+    antiConnections[name] = track(conn)
+    return conn
+end
+
+local function disconnectAnti(name)
+    if antiConnections[name] then
+        pcall(function()
+            antiConnections[name]:Disconnect()
+        end)
+        antiConnections[name] = nil
+    end
+end
+
+local function getCharacterPart(partName, player)
+    local character = (player or plr).Character
+    if not character then
+        return nil
+    end
+
+    if partName == "hrp" then
+        partName = "HumanoidRootPart"
+    elseif partName == "hum" then
+        partName = "Humanoid"
+    end
+
+    return character:FindFirstChild(partName)
+end
+
+local function breakvel()
+    local zero = Vector3.new(0, 0, 0)
+    local endTime = tick() + 1
+
+    while tick() < endTime and Controller.running do
+        if plr.Character then
+            for _, part in ipairs(plr.Character:GetChildren()) do
+                if part:IsA("BasePart") then
+                    part.Velocity = zero
+                    part.RotVelocity = zero
+                    part.AssemblyLinearVelocity = zero
+                    part.AssemblyAngularVelocity = zero
+                end
+            end
+        end
+        task.wait()
+    end
+end
+
+local function askreset()
+    local hum = getCharacterPart("hum")
+    if hum and hum.Health > 0 then
+        state.resetting = true
+        hum.Health = 0
+        trackThread(task.delay(4, function()
+            state.resetting = false
+        end))
+    end
+end
+
+local function askunstun()
+    local hum = getCharacterPart("hum")
+    if hum then
+        hum.PlatformStand = false
+        hum.Sit = false
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+    end
+end
+
+local function removeForcedMovers(character)
+    if not character then return end
+
+    for _, mover in ipairs(character:GetDescendants()) do
+        if not mover:FindFirstAncestorOfClass("Tool")
+            and (mover:IsA("BodyVelocity")
+                or mover:IsA("BodyAngularVelocity")
+                or mover:IsA("BodyPosition")
+                or mover:IsA("BodyGyro")
+                or mover:IsA("LinearVelocity")
+                or mover:IsA("AngularVelocity")
+                or mover:IsA("VectorForce")
+                or mover:IsA("AlignPosition")
+                or mover:IsA("AlignOrientation"))
+        then
+            pcall(function()
+                mover:Destroy()
+            end)
+        end
+    end
+end
+
+local function StartAntiVoid()
+    if antiConnections["Void"] then
+        antiConnections["Void"]:Disconnect()
+    end
+
+    workspace.FallenPartsDestroyHeight = -50000
+
+    setAntiConnection("Void", RunService.Stepped:Connect(function()
+        if not antiVoidEnabled or not plr.Character then return end
+        local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        if hrp.Position.Y < -100 then
+            hrp.CFrame = CFrame.new(0, 100, 0)
+            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end
+    end))
+end
+
+local function StopAntiVoid()
+    disconnectAnti("Void")
+    workspace.FallenPartsDestroyHeight = originalDestroyHeight
+end
+
+local function StartAntiGravity()
+    local _gravT = 0
+    setAntiConnection("Gravity", RunService.Heartbeat:Connect(function(dt)
+        _gravT = _gravT + dt
+        if _gravT < 0.1 then return end
+        _gravT = 0
+        if not antiGravityEnabled then return end
+        if plr:GetAttribute("Flying") == true then return end
+        if workspace.Gravity ~= 196.2 then
+            workspace.Gravity = 196.2
+        end
+    end))
+end
+
+local function StopAntiGravity()
+    disconnectAnti("Gravity")
+end
+
+local function StartAntiBlind()
+    local _blindT = 0
+    setAntiConnection("Blind", RunService.Heartbeat:Connect(function(dt)
+        _blindT = _blindT + dt
+        if _blindT < 0.5 then return end
+        _blindT = 0
+        local blindGui = playerGui:FindFirstChild("Blind") or playerGui:FindFirstChild("BlindGUI")
+        if blindGui then
+            blindGui.Enabled = false
+        end
+        local ownerBlinder = playerGui:FindFirstChild("OwnerBlinder")
+        if ownerBlinder then
+            ownerBlinder:Destroy()
+        end
+    end))
+end
+
+local function StartAntiDrag()
+    local _dragT = 0
+    setAntiConnection("Drag", RunService.Heartbeat:Connect(function(dt)
+        _dragT = _dragT + dt
+        if _dragT < 0.1 then return end
+        _dragT = 0
+        if stashRunning then return end
+        local char = plr.Character
+        if char then
+            local Dragger = char:FindFirstChild("Dragger")
+            local Humanoid = char:FindFirstChildWhichIsA("Humanoid")
+            if Dragger and Humanoid then
+                pcall(function()
+                    Dragger.ResponseStyle = Enum.DragDetectorResponseStyle.Custom
+                end)
+                if Humanoid.PlatformStand then
+                    Humanoid.PlatformStand = false
+                    Humanoid.Sit = false
+                    Humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+                end
+            end
+        end
+    end))
+end
+
+local function StartAntiJail()
+    local _jailT = 0
+    setAntiConnection("Jail", RunService.Heartbeat:Connect(function(dt)
+        _jailT = _jailT + dt
+        if _jailT < 0.5 then return end
+        _jailT = 0
+        if plr.Character and plr.Character:FindFirstChild("Jail") then
+            for _, part in pairs(plr.Character.Jail:GetChildren()) do
+                pcall(function()
+                    part.CanCollide = false
+                    part.CanTouch = false
+                    part.CanQuery = false
+                end)
+            end
+        end
+    end))
+end
+
+local function StartAntiFreeze()
+    disconnectAnti("FreezeRespawn")
+
+    local _freezeT = 0
+    local _lastGoodCF = nil
+
+    setAntiConnection("Freeze", RunService.Heartbeat:Connect(function(dt)
+        _freezeT = _freezeT + dt
+        if _freezeT < 0.5 then return end
+        _freezeT = 0
+        if stashRunning then return end
+        if not plr.Character then return end
+
+        local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+        local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+
+        if hrp and hum and hum.Health > 0 and not hrp.Anchored then
+            _lastGoodCF = hrp.CFrame
+        end
+
+        local frozen = false
+        if workspace:FindFirstChild(plr.Name) and workspace[plr.Name]:FindFirstChild("Hielo") then
+            if hum then
+                state.resetting = true
+                hum:ChangeState(Enum.HumanoidStateType.Dead)
+            end
+            frozen = true
+        end
+        if hrp and hum and hrp.Anchored == true then
+            state.resetting = true
+            hum.Health = 0
+            frozen = true
+        end
+        if plr.Character:FindFirstChild("Torso") and hum and plr.Character.Torso.Transparency == 1 then
+            state.resetting = true
+            hum.Health = 0
+            frozen = true
+        end
+
+        if frozen and _lastGoodCF then
+            local savedCF = _lastGoodCF
+            setAntiConnection("FreezeRespawn", plr.CharacterAdded:Once(function(newChar)
+                task.wait(0.5)
+                local newHrp = newChar:WaitForChild("HumanoidRootPart", 5)
+                if newHrp then
+                    newHrp.CFrame = savedCF
+                end
+                state.resetting = false
+            end))
+        end
+    end))
+end
+
+local function StartAntiMyopicBlur()
+    local _myopicT = 0
+    setAntiConnection("MyopicBlur", RunService.Heartbeat:Connect(function(dt)
+        _myopicT = _myopicT + dt
+        if _myopicT < 0.5 then return end
+        _myopicT = 0
+        if Lighting:FindFirstChild("BlurEffect") then Lighting.BlurEffect.Enabled = false end
+        if Lighting:FindFirstChild("Blur") then Lighting.Blur.Enabled = false end
+        if Lighting:FindFirstChild("DepthOfField") then Lighting.DepthOfField.Enabled = false end
+    end))
+end
+
+local function StartAntiFog()
+    local _fogT = 0
+    setAntiConnection("Fog", RunService.Heartbeat:Connect(function(dt)
+        _fogT = _fogT + dt
+        if _fogT < 0.5 then return end
+        _fogT = 0
+        if Lighting:FindFirstChild("Fog") then Lighting.Fog.Density = 0 end
+    end))
+end
+
+local function StartAntiVampire()
+    local _vampireT = 0
+    setAntiConnection("Vampire", RunService.Heartbeat:Connect(function(dt)
+        _vampireT = _vampireT + dt
+        if _vampireT < 0.5 then return end
+        _vampireT = 0
+        if plr.Character and plr.Character:FindFirstChild("Humanoid") and workspace.CurrentCamera then
+            local camera = workspace.CurrentCamera
+            local char = plr.Character
+            camera.CameraType = Enum.CameraType.Custom
+            camera.CameraSubject = char.Humanoid
+            pcall(function()
+                StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, true)
+            end)
+            if camera.CFrame.Position.Y > 1000 or camera.CFrame.Position.Y < -1000 then
+                camera.CFrame = CFrame.new(char:GetPivot().Position + Vector3.new(0, 5, -10))
+            end
+            if camera.FieldOfView ~= 70 then
+                camera.FieldOfView = 70
+            end
+        end
+    end))
+end
+
+local function StartAntiFling()
+    local flingSpeedCap = 200
+    local maxStuds = 10000
+
+    setAntiConnection("Fling", RunService.Heartbeat:Connect(function()
+        if not plr.Character then return end
+
+        local root = plr.Character:FindFirstChild("HumanoidRootPart")
+        if not root then return end
+        if _flingInProgress then return end
+
+        local velocity = root.AssemblyLinearVelocity
+        local speed = velocity.Magnitude
+        local pos = root.Position
+
+        if speed > flingSpeedCap then
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+        end
+
+        if math.abs(pos.X) > maxStuds or
+            math.abs(pos.Y) > maxStuds or
+            math.abs(pos.Z) > maxStuds then
+            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            plr.Character:PivotTo(CFrame.new(0, 200, 0))
+            breakvel()
+        end
+    end))
+end
+
+local function StartAntiInvisible()
+    local _invisT = 0
+    setAntiConnection("Invisible", RunService.Heartbeat:Connect(function(dt)
+        _invisT = _invisT + dt
+        if _invisT < 0.5 then return end
+        _invisT = 0
+        if plr.Character and plr.Character:FindFirstChild("Torso") and
+            plr.Character:FindFirstChild("Humanoid") and plr.Character.Torso.Transparency == 1 then
+            askreset()
+        end
+    end))
+end
+
+local function StartAntiToxify()
+    disconnectAnti("Toxify")
+    disconnectAnti("ToxifyChar")
+    disconnectAnti("ToxifyHealth")
+    disconnectAnti("ToxifyWaitHumanoid")
+
+    local function _attachHealth(char)
+        disconnectAnti("ToxifyHealth")
+        disconnectAnti("ToxifyWaitHumanoid")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum then
+            setAntiConnection("ToxifyWaitHumanoid", char.ChildAdded:Connect(function(child)
+                if child:IsA("Humanoid") then
+                    _attachHealth(char)
+                end
+            end))
+            return
+        end
+        pcall(function()
+            hum.MaxHealth = math.huge
+            hum.Health = math.huge
+        end)
+        setAntiConnection("ToxifyHealth", hum.HealthChanged:Connect(function(hp)
+            if state.resetting then return end
+            if hp < math.huge then
+                task.defer(function()
+                    pcall(function()
+                        hum.MaxHealth = math.huge
+                        hum.Health = math.huge
+                    end)
+                end)
+            end
+        end))
+    end
+
+    if plr.Character then _attachHealth(plr.Character) end
+    setAntiConnection("ToxifyChar", plr.CharacterAdded:Connect(function(char)
+        task.wait(0.25)
+        _attachHealth(char)
+    end))
+
+    local _toxifyT = 0
+    setAntiConnection("Toxify", RunService.Heartbeat:Connect(function(dt)
+        _toxifyT = _toxifyT + dt
+        if _toxifyT < 0.5 then return end
+        _toxifyT = 0
+        pcall(function() Lighting.Blur.Enabled = false end)
+        pcall(function() Lighting.RGB.Enabled = false end)
+        pcall(function() Lighting.Fog.Density = 0 end)
+    end))
+end
+
+local function StartAntiNoColor()
+    local _noColorT = 0
+    setAntiConnection("NoColor", RunService.Heartbeat:Connect(function(dt)
+        _noColorT = _noColorT + dt
+        if _noColorT < 0.5 then return end
+        _noColorT = 0
+        if Lighting:FindFirstChild("ColorCorrection") then
+            Lighting.ColorCorrection.Enabled = false
+        end
+    end))
+end
+
+local function StartAntiStun()
+    local _stunT = 0
+    setAntiConnection("Stun", RunService.Heartbeat:Connect(function(dt)
+        _stunT = _stunT + dt
+        if _stunT < 0.5 then return end
+        _stunT = 0
+        if stashRunning then return end
+        if plr.Character and plr.Character:FindFirstChild("Humanoid") and
+            plr.Character.Humanoid.PlatformStand == true then
+            askunstun()
+        end
+    end))
+end
+
+local function StartAntiFarlands()
+    local _farlandsT = 0
+    setAntiConnection("Farlands", RunService.Heartbeat:Connect(function(dt)
+        _farlandsT = _farlandsT + dt
+        if _farlandsT < 0.1 then return end
+        _farlandsT = 0
+        if stashRunning then return end
+        if plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") then
+            local pos = plr.Character.HumanoidRootPart.Position
+            if math.abs(pos.X) > 10000 or math.abs(pos.Y) > 10000 or math.abs(pos.Z) > 10000 then
+                plr.Character:PivotTo(CFrame.new(0, 51, 0))
+                plr.Character.HumanoidRootPart.Velocity = Vector3.new(0, 0, 0)
+                plr.Character.HumanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                breakvel()
+            end
+        end
+    end))
+end
+
+local function StartAntiCursed()
+    local _cursedT = 0
+    setAntiConnection("Cursed", RunService.Heartbeat:Connect(function(dt)
+        _cursedT = _cursedT + dt
+        if _cursedT < 0.5 then return end
+        _cursedT = 0
+        if Lighting:FindFirstChild("RGB") then Lighting.RGB.Enabled = false end
+        if Lighting:FindFirstChild("ColorCorrection") then Lighting.ColorCorrection.Enabled = false end
+    end))
+end
+
+local function StartAntiMove()
+    local _moveT = 0
+    setAntiConnection("Move", RunService.Heartbeat:Connect(function(dt)
+        _moveT = _moveT + dt
+        if _moveT < 0.1 then return end
+        _moveT = 0
+        if stashRunning then return end
+        if plr.Character then
+            removeForcedMovers(plr.Character)
+            local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+            if hum then
+                hum.PlatformStand = false
+                hum.Sit = false
+                hum.AutoRotate = true
+            end
+        end
+    end))
+end
+
+local function startAlwaysOnAntis()
+    if not ENABLE_ALWAYS_ON_ANTIS then
+        return
+    end
+
+    antiVoidEnabled = true
+    antiGravityEnabled = true
+    StartAntiVoid()
+    StartAntiGravity()
+    StartAntiBlind()
+    StartAntiDrag()
+    StartAntiJail()
+    StartAntiFreeze()
+    StartAntiMyopicBlur()
+    StartAntiFog()
+    StartAntiCursed()
+    StartAntiVampire()
+    StartAntiFling()
+    StartAntiInvisible()
+    StartAntiToxify()
+    StartAntiNoColor()
+    StartAntiStun()
+    StartAntiFarlands()
+    StartAntiMove()
+end
+
+local function getDonateCommand(amount)
+    local commandName = state.hiddenDonations and ";donate" or "donate"
+    -- Use the full owner name, NOT a short "pea" prefix — that partial-matched
+    -- other players (e.g. "peanut") and the bots donated their time to them.
+    -- "pealz" is a substring of the owner username "0pealz" so it still resolves
+    -- to the owner while being specific enough to avoid mismatches.
+    return commandName .. " " .. OWNER_DISPLAY_NAME .. " " .. tostring(math.floor(amount))
+end
+
+local function getTimeStatValue()
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if not leaderstats then
+        return nil
+    end
+
+    local timeStat = leaderstats:FindFirstChild("Time")
+
+    if not timeStat then
+        for _, stat in ipairs(leaderstats:GetChildren()) do
+            if string.lower(stat.Name) == "time" then
+                timeStat = stat
+                break
+            end
+        end
+    end
+
+    if not timeStat then
+        return nil
+    end
+
+    local rawValue = tostring(timeStat.Value)
+    local cleanString = string.gsub(rawValue, ",", "")
+    return tonumber(cleanString)
+end
+
+local function donateTime(amount, force)
+    local donateAmount = math.floor(tonumber(amount) or getTimeStatValue() or 0)
+
+    if donateAmount <= 0 then
+        return false
+    end
+
+    if not force and donateAmount < AUTO_DONATE_MIN_TIME then
+        return false
+    end
+
+    local now = os.clock()
+    if not force and now - state.lastDonateAt < AUTO_DONATE_COOLDOWN then
+        return false
+    end
+
+    state.lastDonateAt = now
+    return sendPriorityChat(getDonateCommand(donateAmount))
+end
+
+startAlwaysOnAntis()
+
+-- [[ FOCUS HEARTBEAT ]]
+trackThread(task.spawn(function()
+    if not FOCUS_HEARTBEAT_ENABLED then
+        return
+    end
+
+    local focusRemote = ReplicatedStorage:FindFirstChild("System") or ReplicatedStorage:WaitForChild("System", 10)
+
+    while Controller.running do
+        if focusRemote and focusRemote:IsA("RemoteEvent") then
+            pcall(function()
+                focusRemote:FireServer("Focused")
+            end)
+        end
+
+        task.wait(FOCUS_HEARTBEAT_INTERVAL)
+    end
+end))
+
+-- [[ PLAYER LIST TOGGLE ]]
+local playerListEnabled = true
+
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if input.KeyCode == Enum.KeyCode.Tab and not UserInputService:GetFocusedTextBox() then
+        playerListEnabled = not playerListEnabled
+
+        pcall(function()
+            StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, playerListEnabled)
+        end)
+    end
+end))
+
+-- [[ AUTO DONATE ]]
+trackThread(task.spawn(function()
+    if not isBot or not AUTO_DONATE_ENABLED then
+        return
+    end
+
+    while Controller.running do
+        task.wait(3)
+
+        local numValue = getTimeStatValue()
+
+        if numValue and numValue >= AUTO_DONATE_MIN_TIME then
+            donateTime(numValue, false)
+            task.wait(AUTO_DONATE_COOLDOWN)
+        end
+    end
+end))
+
+-- [[ FORMATIONS ]]
+-- Forward declarations for weld-follow plumbing defined further below; needed
+-- so setNormalMode (declared next) can reference them safely.
+local clearWeldFollow
+local buildWeldFollow
+local refreshWeldFollowSlot
+local weldFollow = {
+    botAttachment = nil,
+    ownerAttachment = nil,
+    alignPos = nil,
+    alignOri = nil,
+    ownerCharConn = nil,
+    botCharConn = nil,
+    boundOwner = nil,
+}
+
+local function resetFollowTracker()
+    state.lastFollowMoveTo = 0
+    state.followStuckSince = nil
+    state.followStuckCheckPos = nil
+    state.followStuckCheckDistance = nil
+end
+
+local function setNormalMode()
+    state.mode = "idle"
+    state.partying = false
+    state.partyToken = state.partyToken + 1
+    state.spinUntil = 0
+    resetFollowTracker()
+    -- Tear down welded follow if it's running. Safe to call when no-op.
+    if clearWeldFollow then
+        pcall(clearWeldFollow)
+    end
+end
+
+local function computeFollowCFrame(ownerRoot, roster, index)
+    local count = math.max(#roster, 1)
+    local perRow = math.clamp(math.ceil(math.sqrt(count)), 2, 5)
+    local row = math.floor((index - 1) / perRow)
+    local col = (index - 1) % perRow
+    local rowStart = row * perRow
+    local rowCount = math.min(perRow, count - rowStart)
+    local centerOffset = col - ((rowCount - 1) / 2)
+    local sideOffset = centerOffset * FOLLOW_SIDE_SPACING
+    local backOffset = FOLLOW_DISTANCE + row * FOLLOW_ROW_DEPTH
+
+    return ownerRoot.CFrame * CFrame.new(sideOffset, 0, backOffset)
+end
+
+local function fastFollow(ownerRoot, roster, index)
+    local targetCFrame = computeFollowCFrame(ownerRoot, roster, index)
+    local targetPosition = targetCFrame.Position
+    safeTeleport(CFrame.lookAt(targetPosition, targetPosition + ownerRoot.CFrame.LookVector))
+end
+
+-- [[ WALKING FOLLOW ]]
+-- Realistic follow: the bot actually WALKS to its formation slot using
+-- Humanoid:MoveTo (so the run/walk animation and natural turning play), jumps
+-- when stuck or when the owner jumps, and only teleports as a last resort if it
+-- falls hopelessly far behind. This replaces the rigid weld-drag follow, which
+-- looked teleporty and played no locomotion animation.
+local function walkFollow(ownerRoot, roster, index, owner)
+    local botRoot = getRoot(LocalPlayer)
+    local humanoid = getHumanoid(LocalPlayer)
+    if not botRoot or not humanoid or humanoid.Health <= 0 then
+        return
+    end
+
+    local targetPos = computeFollowCFrame(ownerRoot, roster, index).Position
+    local dist = (botRoot.Position - targetPos).Magnitude
+    local now = os.clock()
+
+    -- Hopelessly far (owner teleported / huge lag): snap to catch up.
+    if dist > FOLLOW_TELEPORT_DISTANCE then
+        safeTeleport(CFrame.lookAt(targetPos, targetPos + ownerRoot.CFrame.LookVector))
+        resetFollowTracker()
+        return
+    end
+
+    if dist > FOLLOW_WALK_STOP_DISTANCE then
+        -- Re-issue MoveTo on an interval (not every frame) so the humanoid keeps
+        -- a stable heading instead of stuttering.
+        if now - (state.lastFollowMoveTo or 0) > FOLLOW_REPATH_INTERVAL then
+            state.lastFollowMoveTo = now
+            pcall(function() humanoid:MoveTo(targetPos) end)
+        end
+
+        -- Stuck detection: barely moved while still far from the slot → jump to
+        -- clear a ledge/obstacle.
+        local cp = state.followStuckCheckPos
+        if cp == nil then
+            state.followStuckCheckPos = botRoot.Position
+            state.followStuckSince = now
+        elseif (botRoot.Position - cp).Magnitude < 2 then
+            if state.followStuckSince and now - state.followStuckSince > FOLLOW_STUCK_SECONDS then
+                humanoid.Jump = true
+                state.followStuckSince = now
+            end
+        else
+            state.followStuckCheckPos = botRoot.Position
+            state.followStuckSince = now
+        end
+    else
+        -- Arrived: stop (idle animation) and reset stuck tracking.
+        pcall(function() humanoid:MoveTo(botRoot.Position) end)
+        resetFollowTracker()
+    end
+
+    -- Mirror the owner's jump so the group hops together.
+    local ownerHum = owner and getHumanoid(owner)
+    if ownerHum then
+        local ownerState = ownerHum:GetState()
+        local myState = humanoid:GetState()
+        if (ownerState == Enum.HumanoidStateType.Jumping or ownerState == Enum.HumanoidStateType.Freefall)
+            and myState ~= Enum.HumanoidStateType.Jumping
+            and myState ~= Enum.HumanoidStateType.Freefall then
+            humanoid.Jump = true
+        end
+    end
+end
+
+-- [[ WELD-STYLE FOLLOW ]]
+-- True Welds across player characters aren't authoritative from a client, so
+-- we use AlignPosition + AlignOrientation with RigidityEnabled. The constraint
+-- solver pins the bot to a moving offset attached to the owner's HRP every
+-- physics step. Result: instant snap, near-zero per-frame Lua cost, and no
+-- per-frame CFrame replication storms.
+-- (weldFollow table + clearWeldFollow/buildWeldFollow/refreshWeldFollowSlot
+-- forward-declared above so setNormalMode can reference them.)
+clearWeldFollow = function()
+    for _, instance in ipairs({weldFollow.alignPos, weldFollow.alignOri, weldFollow.botAttachment, weldFollow.ownerAttachment}) do
+        if instance then
+            pcall(function() instance:Destroy() end)
+        end
+    end
+
+    if weldFollow.ownerCharConn then
+        pcall(function() weldFollow.ownerCharConn:Disconnect() end)
+    end
+    if weldFollow.botCharConn then
+        pcall(function() weldFollow.botCharConn:Disconnect() end)
+    end
+
+    weldFollow.alignPos = nil
+    weldFollow.alignOri = nil
+    weldFollow.botAttachment = nil
+    weldFollow.ownerAttachment = nil
+    weldFollow.ownerCharConn = nil
+    weldFollow.botCharConn = nil
+    weldFollow.boundOwner = nil
+end
+
+buildWeldFollow = function()
+    clearWeldFollow()
+
+    local owner = getOwnerPlayer()
+    if not owner then return end
+    local ownerRoot = getRoot(owner)
+    local botRoot = getRoot(LocalPlayer)
+    local humanoid = getHumanoid(LocalPlayer)
+    if not ownerRoot or not botRoot or not humanoid or humanoid.Health <= 0 then
+        return
+    end
+
+    weldFollow.boundOwner = owner
+
+    local roster = getBotRoster()
+    local index = getLocalBotIndex(roster) or 1
+    local relativeCF = ownerRoot.CFrame:ToObjectSpace(computeFollowCFrame(ownerRoot, roster, index))
+
+    local ownerAttach = Instance.new("Attachment")
+    ownerAttach.Name = "PealzFollowOwnerSlot"
+    ownerAttach.CFrame = relativeCF
+    ownerAttach.Parent = ownerRoot
+
+    local botAttach = Instance.new("Attachment")
+    botAttach.Name = "PealzFollowBotAnchor"
+    botAttach.Parent = botRoot
+
+    local alignPos = Instance.new("AlignPosition")
+    alignPos.Name = "PealzFollowAlignPos"
+    alignPos.Mode = Enum.PositionAlignmentMode.TwoAttachment
+    alignPos.Attachment0 = botAttach
+    alignPos.Attachment1 = ownerAttach
+    alignPos.RigidityEnabled = true
+    alignPos.ApplyAtCenterOfMass = true
+    alignPos.MaxForce = math.huge
+    alignPos.Responsiveness = 200
+    alignPos.Parent = botRoot
+
+    local alignOri = Instance.new("AlignOrientation")
+    alignOri.Name = "PealzFollowAlignOri"
+    alignOri.Mode = Enum.OrientationAlignmentMode.TwoAttachment
+    alignOri.Attachment0 = botAttach
+    alignOri.Attachment1 = ownerAttach
+    alignOri.RigidityEnabled = true
+    alignOri.MaxTorque = math.huge
+    alignOri.Responsiveness = 200
+    alignOri.Parent = botRoot
+
+    weldFollow.ownerAttachment = ownerAttach
+    weldFollow.botAttachment = botAttach
+    weldFollow.alignPos = alignPos
+    weldFollow.alignOri = alignOri
+
+    -- Rebuild if either character respawns.
+    weldFollow.ownerCharConn = owner.CharacterAdded:Connect(function()
+        if state.mode == "follow" then
+            task.wait(1)
+            if state.mode == "follow" then buildWeldFollow() end
+        end
+    end)
+    weldFollow.botCharConn = LocalPlayer.CharacterAdded:Connect(function()
+        if state.mode == "follow" then
+            task.wait(1)
+            if state.mode == "follow" then buildWeldFollow() end
+        end
+    end)
+end
+
+-- Re-tune slot when bot roster changes (someone joined/left) so the formation
+-- column stays correct. Cheap: just edit the existing attachment's CFrame.
+refreshWeldFollowSlot = function()
+    if state.mode ~= "follow" or not weldFollow.ownerAttachment or not weldFollow.boundOwner then
+        return
+    end
+    local ownerRoot = getRoot(weldFollow.boundOwner)
+    if not ownerRoot then return end
+    local roster = getBotRoster()
+    local index = getLocalBotIndex(roster) or 1
+    weldFollow.ownerAttachment.CFrame = ownerRoot.CFrame:ToObjectSpace(computeFollowCFrame(ownerRoot, roster, index))
+end
+
+local function computeFormationCFrame(ownerRoot, roster, index)
+    local count = math.max(#roster, 1)
+
+    if state.mode == "follow" then
+        return nil
+    end
+
+    if state.mode == "line" then
+        local centerOffset = index - ((count + 1) / 2)
+        local base = ownerRoot.CFrame * CFrame.new(0, 0, state.lineDistance)
+        local pos = base.Position + ownerRoot.CFrame.RightVector * (centerOffset * state.spacing)
+        return CFrame.lookAt(pos, pos + ownerRoot.CFrame.LookVector)
+    end
+
+    if state.mode == "circle" then
+        local angle = ((index - 1) / count) * math.pi * 2
+        local pos = ownerRoot.Position
+            + ownerRoot.CFrame.RightVector * math.cos(angle) * state.circleRadius
+            + ownerRoot.CFrame.LookVector * math.sin(angle) * state.circleRadius
+        return CFrame.lookAt(pos, ownerRoot.Position)
+    end
+
+    if state.mode == "orbit" then
+        local angle = (os.clock() * state.orbitSpeed) + (((index - 1) / count) * math.pi * 2)
+        local pos = ownerRoot.Position
+            + ownerRoot.CFrame.RightVector * math.cos(angle) * state.orbitRadius
+            + ownerRoot.CFrame.LookVector * math.sin(angle) * state.orbitRadius
+        return CFrame.lookAt(pos, ownerRoot.Position)
+    end
+
+    if state.mode == "party" then
+        local angle = (((index - 1) / count) * math.pi * 2) + math.sin(os.clock() + index) * 0.12
+        local radius = DEFAULT_CIRCLE_RADIUS + ((index % 3) - 1) * 1.5
+        local pos = ownerRoot.Position
+            + ownerRoot.CFrame.RightVector * math.cos(angle) * radius
+            + ownerRoot.CFrame.LookVector * math.sin(angle) * radius
+        return CFrame.lookAt(pos, ownerRoot.Position)
+    end
+
+    if state.mode == "scatter" then
+        local angle = math.rad((index * 137) % 360)
+        local radius = state.scatterRadius + ((index % 4) * 2)
+        local pos = ownerRoot.Position
+            + ownerRoot.CFrame.RightVector * math.cos(angle) * radius
+            + ownerRoot.CFrame.LookVector * math.sin(angle) * radius
+        return CFrame.lookAt(pos, ownerRoot.Position)
+    end
+
+    if state.mode == "tower" then
+        local base = ownerRoot.CFrame * CFrame.new(0, 0, -state.towerDistance)
+        local pos = base.Position + Vector3.new(0, (index - 1) * state.towerSpacing, 0)
+        return CFrame.lookAt(pos, pos + ownerRoot.CFrame.LookVector)
+    end
+
+    -- ---- Extra shape formations ----
+    -- Shared frame vectors and two facing helpers (face the owner, or face the
+    -- owner's forward). Declared here so only the shape branches pay for them.
+    local O = ownerRoot.Position
+    local R = ownerRoot.CFrame.RightVector
+    local L = ownerRoot.CFrame.LookVector
+    local U = ownerRoot.CFrame.UpVector
+    local sp = state.shapeSpacing
+    local rad = state.shapeRadius
+    local dist = state.shapeDistance
+    local function faceOwner(pos) return CFrame.lookAt(pos, O) end
+    local function faceFwd(pos) return CFrame.lookAt(pos, pos + L) end
+
+    if state.mode == "square" then
+        -- Even spread around a square outline centered on the owner.
+        local t = ((index - 1) % count) / count * 4
+        local side = math.floor(t)
+        local f = t - side
+        local sx, sz
+        if side == 0 then sx, sz = -rad + 2 * rad * f, -rad
+        elseif side == 1 then sx, sz = rad, -rad + 2 * rad * f
+        elseif side == 2 then sx, sz = rad - 2 * rad * f, rad
+        else sx, sz = -rad, rad - 2 * rad * f end
+        return faceOwner(O + R * sx + L * sz)
+    end
+
+    if state.mode == "diamond" then
+        local verts = { {0, -rad}, {rad, 0}, {0, rad}, {-rad, 0}, {0, -rad} }
+        local t = ((index - 1) % count) / count * 4
+        local side = math.floor(t)
+        local f = t - side
+        local a, b = verts[side + 1], verts[side + 2]
+        return faceOwner(O + R * (a[1] + (b[1] - a[1]) * f) + L * (a[2] + (b[2] - a[2]) * f))
+    end
+
+    if state.mode == "grid" then
+        local cols = math.max(math.ceil(math.sqrt(count)), 1)
+        local row = math.floor((index - 1) / cols)
+        local colN = (index - 1) % cols
+        local base = O + L * dist
+        return faceFwd(base + R * ((colN - (cols - 1) / 2) * sp) + L * (row * sp))
+    end
+
+    if state.mode == "wall" then
+        -- Vertical plane in front (stacks upward instead of away).
+        local cols = math.max(math.ceil(math.sqrt(count)), 1)
+        local row = math.floor((index - 1) / cols)
+        local colN = (index - 1) % cols
+        local base = O + L * dist
+        return faceFwd(base + R * ((colN - (cols - 1) / 2) * sp) + U * (row * sp))
+    end
+
+    if state.mode == "triangle" then
+        -- Bowling-pin rows: widths 1, 2, 3, … growing away from the owner.
+        local row, placed = 0, 0
+        while placed + (row + 1) < index do placed = placed + (row + 1); row = row + 1 end
+        local posInRow = index - placed - 1
+        local base = O + L * dist
+        return faceFwd(base + R * ((posInRow - row / 2) * sp) + L * (row * sp))
+    end
+
+    if state.mode == "pyramid" then
+        -- Vertical pyramid: widest row at the bottom, narrowing as it rises.
+        local n = 1
+        while n * (n + 1) / 2 < count do n = n + 1 end
+        local row, placed, width = 0, 0, n
+        while placed + width < index and width > 1 do
+            placed = placed + width; row = row + 1; width = n - row
+        end
+        local posInRow = index - placed - 1
+        local base = O + L * dist
+        return faceFwd(base + R * ((posInRow - (width - 1) / 2) * sp) + U * (row * sp))
+    end
+
+    if state.mode == "cross" then
+        local arm = math.floor((index - 1) / 4)
+        local dir = (index - 1) % 4
+        local off = (arm + 1) * sp
+        local dx, dz = 0, 0
+        if dir == 0 then dz = off elseif dir == 1 then dz = -off
+        elseif dir == 2 then dx = off else dx = -off end
+        return faceOwner(O + R * dx + L * dz)
+    end
+
+    if state.mode == "wedge" then
+        -- V opening forward: alternating bots fan out left/right and back.
+        local depth = math.ceil(index / 2)
+        local sideSign = (index % 2 == 0) and 1 or -1
+        local base = O + L * dist
+        return faceFwd(base + R * (sideSign * depth * sp * 0.7) - L * (depth * sp))
+    end
+
+    if state.mode == "arc" then
+        local a = (count == 1) and 0.5 or ((index - 1) / (count - 1))
+        local ang = math.rad(-90 + a * 180)
+        return faceOwner(O + R * math.sin(ang) * rad + L * math.cos(ang) * rad)
+    end
+
+    if state.mode == "zigzag" then
+        local base = O + L * dist
+        local sideSign = (index % 2 == 0) and 1 or -1
+        return faceFwd(base + L * ((index - 1) * sp) + R * (sideSign * sp))
+    end
+
+    if state.mode == "star" then
+        local t = ((index - 1) % count) / count
+        local ang = t * math.pi * 2
+        local rr = (math.floor(t * 10) % 2 == 0) and rad or rad * 0.45
+        return faceOwner(O + R * math.cos(ang) * rr + L * math.sin(ang) * rr)
+    end
+
+    if state.mode == "spiral" then
+        local ang = (index - 1) * 0.6
+        local rr = 3 + (index - 1) * sp * 0.35
+        return faceOwner(O + R * math.cos(ang) * rr + L * math.sin(ang) * rr)
+    end
+
+    if state.mode == "heart" then
+        local s = rad / 16
+        local t = ((index - 1) % count) / count * math.pi * 2
+        local hx = 16 * math.sin(t) ^ 3
+        local hz = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+        return faceOwner(O + R * (hx * s) + L * (hz * s))
+    end
+
+    return nil
+end
+
+local formationAccumulator = 0
+
+track(RunService.Heartbeat:Connect(function(dt)
+    if not Controller.running or not isBot then
+        return
+    end
+
+    formationAccumulator = formationAccumulator + dt
+    if formationAccumulator < POSITION_UPDATE_INTERVAL then
+        return
+    end
+    formationAccumulator = 0
+
+    if state.mode == "idle" then
+        return
+    end
+
+    local owner = getOwnerPlayer()
+    local ownerRoot = getRoot(owner)
+    if not ownerRoot then
+        return
+    end
+
+    local roster = getBotRoster()
+    local index = getLocalBotIndex(roster)
+    if not index then
+        return
+    end
+
+    if state.mode == "follow" then
+        -- Realistic walking follow (animations + jumps). The old weld-drag path
+        -- is kept in the file but no longer used for .follow.
+        walkFollow(ownerRoot, roster, index, owner)
+        return
+    end
+
+    local cf = computeFormationCFrame(ownerRoot, roster, index)
+    if cf then
+        safeTeleport(cf)
+    end
+end))
+
+local function applyNoclip()
+    local character = LocalPlayer.Character
+    if not character then
+        return
+    end
+
+    for _, descendant in ipairs(character:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            if noclipOriginalCollisions[descendant] == nil then
+                noclipOriginalCollisions[descendant] = descendant.CanCollide
+            end
+
+            if descendant.CanCollide then
+                setProp(descendant, "CanCollide", false)
+            end
+        end
+    end
+end
+
+track(RunService.Stepped:Connect(function()
+    if Controller.running and isBot and state.noclip then
+        applyNoclip()
+    end
+    -- Owner-only self-noclip (.menoclip) — applies to 0pealz's own character,
+    -- independent of the bot roster's .noclip.
+    if Controller.running and isOwnerAccount and state.selfNoclip then
+        applyNoclip()
+    end
+end))
+
+track(RunService.Heartbeat:Connect(function(dt)
+    if not Controller.running or not isBot or not state.spinUntil or os.clock() >= state.spinUntil then
+        return
+    end
+
+    local root = getRoot(LocalPlayer)
+    if root then
+        pcall(function()
+            root.CFrame = root.CFrame * CFrame.Angles(0, dt * 10, 0)
+        end)
+    end
+end))
+
+-- Forward declarations for entry points referenced from processCommand below.
+-- Without these, wrapping the implementations in do...end would hide them.
+local runFling
+local pwbRunBuildSlice
+local pwbStopBuild
+local pwbAggregateProgress
+local pwbBuildGuiCreate
+local pwbGui
+-- These are defined further down in the COMMANDS / bus section but the
+-- build + fling subsystems above call into them. Forward-declare so the
+-- implementations below populate the SAME upvalue slot the do-blocks see.
+local getLocalBotStagger
+local publishCommandToBus
+local hasCommandBus
+-- getHttpRequestFunction is defined far below (executor request shim) but
+-- remoteRequest() above calls it. Forward-declare so the later assignment
+-- lands in this same upvalue slot instead of leaving a nil global behind
+-- (the root cause of the ":2274 attempt to call a nil value" error).
+local getHttpRequestFunction
+
+-- [[ COLLABORATIVE BUILD (ported 1:1 from pealzware) ]]
+do
+-- High-level design:
+--   * Owner (0pealz) runs a small ScreenGui to paste a build JSON and dispatch.
+--   * Manifest is written to `PealzBuildManifest.json`, the bus carries a
+--     short `.build start <id>` command, bots pick up the manifest, slice it
+--     by `(blockIndex - 1) % botCount + 1 == myBotIndex`, and each bot runs
+--     buildblock() against its slice. Smart dedup against the live cfolder
+--     skips blocks another bot already placed.
+--   * buildblock / createpartrepl / saveblock / sortBlocksByDistanceFromSpawn
+--     are ported verbatim from pealzware.txt (~lines 6800-7445). The only
+--     change is wrapping them in this script's local scope and routing the
+--     game-specific Build/Paint/Shape tool calls through the local player —
+--     which is correct, because each bot account already has these tools.
+
+local pwb = {
+    enabled = false,
+    cfolder = nil,
+    brickname = "Brick",
+    isog = false,
+    stopped = false,
+    skipblock = false,
+    built = false,
+    childcube = nil,
+    oldprt = nil,
+    cubehistory = {},
+    historynum = 0,
+    historymax = 400,
+    gridSize = 4,
+    resizewait = 0.2,
+    colorbool = false,
+    buildingtoxify = false,
+    tp = true,
+    defaultcolor = Color3.fromRGB(192, 192, 192),
+    currentManifestId = nil,
+    completedCount = 0,
+    totalCount = 0,
+    placedThisRun = {},
+    lastProgressWrite = 0,
+}
+
+-- Detect cfolder lazily — only the games where this script is loaded into
+-- have it. If neither Cubes nor Bricks exists we silently disable build.
+pwb.detectCFolder = function()
+    if pwb.cfolder and pwb.cfolder.Parent then return true end
+    local cubes = workspace:FindFirstChild("Cubes")
+    if cubes then
+        pwb.cfolder = cubes
+        pwb.isog = true
+        pwb.brickname = "Cube"
+        return true
+    end
+    local bricks = workspace:FindFirstChild("Bricks")
+    if bricks then
+        pwb.cfolder = bricks
+        pwb.isog = false
+        pwb.brickname = "Brick"
+        return true
+    end
+    return false
+end
+
+-- ------------ BUILD-KIT (bkit) TOOL MANAGEMENT ------------
+-- These BTools games keep Build/Paint/Shape/Delete as Tool instances that the
+-- ";bkit <name>" grant drops into a player's Backpack. Unlike normal tools they
+-- can coexist in the Character simultaneously, and buildblock() expects them to
+-- live there. The original pealzware had equiptool()/GrabTools(); the port lost
+-- them, so a bot whose tools slipped back to the Backpack (respawn, server
+-- reset) silently stopped placing. We restore that: keep all four tools in the
+-- Character, grab from workspace if available, and surface a clear notice when
+-- the bot simply has no bkit.
+pwb.BUILD_TOOLS = { "Build", "Paint", "Shape", "Delete" }
+
+-- Move a single named tool from Backpack into Character (equip). Returns the
+-- tool if it ends up in the Character, nil otherwise.
+pwb.equipTool = function(toolName)
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    local existing = character:FindFirstChild(toolName)
+    if existing and existing:IsA("Tool") then
+        return existing
+    end
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    local inBackpack = backpack and backpack:FindFirstChild(toolName)
+    if inBackpack and inBackpack:IsA("Tool") then
+        -- Some BTools have a disabled LocalScript that needs a kick to re-arm.
+        pcall(function()
+            if inBackpack:FindFirstChild("Script") and inBackpack.Script:IsA("LocalScript") then
+                inBackpack.Script.Disabled = false
+            end
+        end)
+        pcall(function() inBackpack.Parent = character end)
+        return character:FindFirstChild(toolName)
+    end
+    return nil
+end
+
+-- Try to grab a tool the game leaves sitting in workspace (the GrabTools path)
+-- into the Backpack so pwb.equipTool can then pick it up. Best-effort only.
+pwb.grabToolFromWorld = function(toolName)
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if not backpack then return end
+    if backpack:FindFirstChild(toolName) then return end
+    local worldTool = workspace:FindFirstChild(toolName)
+    if worldTool and worldTool:IsA("Tool") then
+        pcall(function() worldTool:Clone().Parent = backpack end)
+    end
+end
+
+-- Ensure all build-kit tools are equipped. Returns true if the *Build* tool
+-- (the one we can't build without) is present in the Character. Notifies the
+-- owner's screen at most once per `pwb.bkitNotifyCooldown` when missing.
+pwb.ensureBuildTools = function(notifyIfMissing)
+    local haveBuild = false
+    for _, toolName in ipairs(pwb.BUILD_TOOLS) do
+        if not pwb.equipTool(toolName) then
+            pwb.grabToolFromWorld(toolName)
+            pwb.equipTool(toolName)
+        end
+        if toolName == "Build" and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Build") then
+            haveBuild = true
+        end
+    end
+
+    if not haveBuild and notifyIfMissing then
+        local now = os.clock()
+        if now - (pwb.lastBkitNotify or 0) > 6 then
+            pwb.lastBkitNotify = now
+            displayLocalMessage(
+                ("%s has no bkit (Build tool missing) — grant it with ;bkit %s")
+                    :format(LocalPlayer.Name, LocalPlayer.Name),
+                Color3.fromRGB(220, 120, 80))
+        end
+    end
+
+    return haveBuild
+end
+
+-- Material name maps (verbatim from pealzware).
+pwb.materials = {}
+pwb.materials[Enum.Material.SmoothPlastic] = "smooth"
+pwb.materials[Enum.Material.Plastic] = "plastic"
+pwb.materials[Enum.Material.CeramicTiles] = "tiles"
+pwb.materials[Enum.Material.Brick] = "bricks"
+pwb.materials[Enum.Material.WoodPlanks] = "planks"
+pwb.materials[Enum.Material.Ice] = "ice"
+pwb.materials[Enum.Material.Grass] = "grass"
+pwb.materials[Enum.Material.Sand] = "sand"
+pwb.materials[Enum.Material.Snow] = "snow"
+pwb.materials[Enum.Material.Glass] = "glass"
+pwb.materials[Enum.Material.Wood] = "wood"
+pwb.materials[Enum.Material.Slate] = "stone"
+pwb.materials[Enum.Material.Pebble] = "pebble"
+pwb.materials[Enum.Material.Marble] = "marble"
+pwb.materials[Enum.Material.Granite] = "granite"
+pwb.materials[Enum.Material.DiamondPlate] = "steel"
+pwb.materials[Enum.Material.Metal] = "metal"
+pwb.materials[Enum.Material.Asphalt] = "asphalt"
+pwb.materials[Enum.Material.Concrete] = "concrete"
+pwb.materials[Enum.Material.Pavement] = "pavement"
+pwb.materials[Enum.Material.Neon] = "neon"
+
+pwb.swappedmaterials = {}
+for k, v in pairs(pwb.materials) do pwb.swappedmaterials[v] = k end
+
+pwb.normalids = {}
+pwb.normalids[Enum.NormalId.Right]  = {Vector3.new(1,0,0),  "X"}
+pwb.normalids[Enum.NormalId.Top]    = {Vector3.new(0,1,0),  "Y"}
+pwb.normalids[Enum.NormalId.Back]   = {Vector3.new(0,0,1),  "Z"}
+pwb.normalids[Enum.NormalId.Left]   = {Vector3.new(-1,0,0), "X"}
+pwb.normalids[Enum.NormalId.Bottom] = {Vector3.new(0,-1,0), "Y"}
+pwb.normalids[Enum.NormalId.Front]  = {Vector3.new(0,0,-1), "Z"}
+
+-- Build tool tracking listener — same shape as pealzware's cubechild handler,
+-- but each bot tracks its OWN placements (cfolder/<botName>/ChildAdded).
+pwb.startCubeTracker = function()
+    if not pwb.detectCFolder() then return end
+    local mySubFolder = pwb.cfolder:FindFirstChild(LocalPlayer.Name)
+    if mySubFolder then
+        track(mySubFolder.ChildAdded:Connect(function(child)
+            pwb.childcube = child
+            pwb.historynum = pwb.historynum + 1
+            if pwb.historynum > pwb.historymax then
+                pwb.historynum = 1
+            end
+            pwb.cubehistory[pwb.historynum] = child
+            pwb.built = true
+        end))
+    else
+        track(pwb.cfolder.ChildAdded:Connect(function(child)
+            -- Some games don't shard cfolder per player; track everything.
+            pwb.childcube = child
+            pwb.historynum = pwb.historynum + 1
+            if pwb.historynum > pwb.historymax then
+                pwb.historynum = 1
+            end
+            pwb.cubehistory[pwb.historynum] = child
+            pwb.built = true
+        end))
+    end
+end
+
+pwb.snap = function(pos, m)
+    return pos -- pealzware's snap() is also a no-op for the typical grid
+end
+
+pwb.roundnum = function(num, m)
+    return math.round((num - 2) / m) * m + 2
+end
+
+-- Create a local preview part (the placement "ghost" pealzware uses to feed
+-- the Build tool's adjacency calculation). Spawned client-side only.
+pwb.createpartrepl = function(pos, bsize, col, mat, transp, anch, collide, sprays)
+    if typeof(pos) == "CFrame" then pos = pos.Position end
+    local p = Instance.new("Part")
+    pwb.oldprt = p
+    p.Anchored = anch ~= false
+    p.CanCollide = collide or false
+    p.CastShadow = false
+    p.CanQuery = false
+    p.Color = col or pwb.defaultcolor
+    p.Transparency = transp or .5
+    p.Material = mat or Enum.Material.SmoothPlastic
+    if bsize ~= nil then
+        pos = Vector3.new((pos.X + (bsize.X/2))-.5, (pos.Y + (bsize.Y/2))-.5, (pos.Z + (bsize.Z/2))-.5)
+    end
+    p.Size = bsize or Vector3.new(pwb.gridSize, pwb.gridSize, pwb.gridSize)
+    p.CFrame = CFrame.new(pos)
+    if sprays then
+        for _, v in pairs(sprays) do
+            local face = Enum.NormalId[v[1]]
+            local image = v[2]
+            local txt = v[3]
+            local surfaceui = Instance.new("SurfaceGui")
+            surfaceui.Face = face
+            surfaceui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+            surfaceui.PixelsPerStud = 50
+            local _, count = string.gsub(txt or "", "#", "l")
+            if count == string.len(txt or "") then
+                local img = Instance.new("ImageLabel")
+                img.Image = image or ""
+                img.BackgroundTransparency = 1
+                img.Size = UDim2.new(1, 0, 1, 0)
+                img.Parent = surfaceui
+            else
+                local textlabel = Instance.new("TextLabel")
+                textlabel.Text = txt or ""
+                textlabel.BackgroundTransparency = 1
+                textlabel.TextScaled = true
+                textlabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+                textlabel.Font = Enum.Font.FredokaOne
+                textlabel.Size = UDim2.new(1, 0, 1, 0)
+                textlabel.Parent = surfaceui
+            end
+            surfaceui.Parent = p
+        end
+    end
+    p.Parent = workspace
+    return p
+end
+
+-- Save one BasePart -> compact block descriptor (verbatim shape).
+pwb.saveblock = function(bl)
+    local blockdata = {}
+    if bl:IsA("BasePart") then
+        blockdata.p = {bl.Position.X, bl.Position.Y, bl.Position.Z}
+        blockdata.c = {math.round(bl.Color.R*255), math.round(bl.Color.G*255), math.round(bl.Color.B*255)}
+        blockdata.a = bl.Anchored
+        blockdata.cc = bl.CanCollide
+        if bl.Size.X ~= pwb.gridSize or bl.Size.Y ~= pwb.gridSize or bl.Size.Z ~= pwb.gridSize then
+            blockdata.p[1] = (blockdata.p[1] - (bl.Size.X/2))+.5
+            blockdata.p[2] = (blockdata.p[2] - (bl.Size.Y/2))+.5
+            blockdata.p[3] = (blockdata.p[3] - (bl.Size.Z/2))+.5
+            blockdata.s = {bl.Size.X, bl.Size.Y, bl.Size.Z}
+        end
+        blockdata.m = pwb.materials[bl.Material]
+        blockdata.o = bl.Material.Name
+        local sprayData = {}
+        for _, child in ipairs(bl:GetChildren()) do
+            if child:IsA("SurfaceGui") then
+                local faceName = child.Face.Name
+                local imageId, txt = "", ""
+                local imgLabel = child:FindFirstChildWhichIsA("ImageLabel", true)
+                local txtLabel = child:FindFirstChildWhichIsA("TextLabel", true)
+                if imgLabel then imageId = imgLabel.Image or "" end
+                if txtLabel then txt = txtLabel.Text or "" end
+                if txt ~= "" or imageId ~= "" then
+                    table.insert(sprayData, {faceName, imageId, txt})
+                end
+            end
+        end
+        if #sprayData > 0 then blockdata.sp = sprayData end
+    end
+    return blockdata
+end
+
+-- Spawn position helper (verbatim).
+pwb.getSpawnPosition = function()
+    local sp = workspace:FindFirstChild("SpawnLocation") or workspace:FindFirstChild("Spawn")
+    if sp then
+        if sp:IsA("Model") then
+            local hrp = sp:FindFirstChild("HumanoidRootPart")
+            if hrp then return hrp.Position end
+        elseif sp:IsA("BasePart") then
+            return sp.Position
+        end
+    end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then return hrp.Position end
+        end
+    end
+    return Vector3.new(0, 100, 0)
+end
+
+pwb.sortBlocksByDistanceFromSpawn = function(buildData)
+    local spawnPos = pwb.getSpawnPosition()
+    for i, block in ipairs(buildData) do
+        local blockPos = Vector3.new(block.p[1], block.p[2], block.p[3])
+        if block.s then
+            blockPos = Vector3.new(
+                blockPos.X + (block.s[1]/2) - 0.5,
+                blockPos.Y + (block.s[2]/2) - 0.5,
+                blockPos.Z + (block.s[3]/2) - 0.5)
+        end
+        block._d = (blockPos - spawnPos).Magnitude
+        block._oi = i
+    end
+    table.sort(buildData, function(a, b) return a._d < b._d end)
+    for _, b in ipairs(buildData) do b._d = nil; b._oi = nil end
+    return buildData
+end
+
+-- Center of the build's axis-aligned bounding box (over block CENTERS). Used as
+-- the pivot for rotation/offset, mirroring pealzware's `previewBuildCenter`.
+pwb.computeBuildCenter = function(blocks)
+    local minV, maxV
+    for _, block in ipairs(blocks) do
+        local posses = block.p or block.pos
+        if posses then
+            local s = block.s or block.size
+            local cx = posses[1] + (s and (s[1] / 2 - 0.5) or 0)
+            local cy = posses[2] + (s and (s[2] / 2 - 0.5) or 0)
+            local cz = posses[3] + (s and (s[3] / 2 - 0.5) or 0)
+            if not minV then
+                minV = { cx, cy, cz }; maxV = { cx, cy, cz }
+            else
+                minV[1] = math.min(minV[1], cx); maxV[1] = math.max(maxV[1], cx)
+                minV[2] = math.min(minV[2], cy); maxV[2] = math.max(maxV[2], cy)
+                minV[3] = math.min(minV[3], cz); maxV[3] = math.max(maxV[3], cz)
+            end
+        end
+    end
+    if not minV then return Vector3.zero end
+    return Vector3.new(
+        (minV[1] + maxV[1]) / 2,
+        (minV[2] + maxV[2]) / 2,
+        (minV[3] + maxV[3]) / 2)
+end
+
+-- Apply rotation (about buildCenter) then offset to a block's corner-anchored
+-- raw position, ported 1:1 from pealzware's per-block transform. With no
+-- rotation and no offset this returns rawPos unchanged.
+pwb.transformBlockPos = function(rawPos, bsize, buildCenter, rotCF, offset)
+    if not rotCF and not offset then
+        return rawPos
+    end
+    local halfOff = Vector3.new(bsize.X / 2 - 0.5, bsize.Y / 2 - 0.5, bsize.Z / 2 - 0.5)
+    local origCenter = rawPos + halfOff
+    local newCenter = origCenter
+    if rotCF and buildCenter then
+        local relPos = origCenter - buildCenter
+        newCenter = buildCenter + (rotCF * relPos)
+    end
+    if offset then
+        newCenter = newCenter + offset
+    end
+    return newCenter - halfOff
+end
+
+-- Tolerances for matching a placed part against a manifest slot. Position and
+-- size are in studs; color is per-channel on the 0-1 scale (~3/255).
+pwb.POS_TOLERANCE = 0.75
+pwb.SIZE_TOLERANCE = 0.75
+pwb.COLOR_TOLERANCE = 0.02
+
+-- World-space center of a manifest block given its corner-anchored rawPos.
+pwb.blockCenter = function(rawPos, bsize)
+    if not bsize then return rawPos end
+    return Vector3.new(
+        rawPos.X + (bsize.X / 2) - 0.5,
+        rawPos.Y + (bsize.Y / 2) - 0.5,
+        rawPos.Z + (bsize.Z / 2) - 0.5)
+end
+
+pwb.vecClose = function(a, b, tol)
+    return math.abs(a.X - b.X) <= tol
+        and math.abs(a.Y - b.Y) <= tol
+        and math.abs(a.Z - b.Z) <= tol
+end
+
+pwb.colorClose = function(a, b)
+    return math.abs(a.R - b.R) <= pwb.COLOR_TOLERANCE
+        and math.abs(a.G - b.G) <= pwb.COLOR_TOLERANCE
+        and math.abs(a.B - b.B) <= pwb.COLOR_TOLERANCE
+end
+
+-- Find the part that occupies the EXACT manifest slot (center + size), not just
+-- any part overlapping the region. This is the crux of the multi-bot dedup fix:
+-- the old GetPartBoundsInBox(size - 0.5) returned ANY neighbour in a dense
+-- build, so every empty slot looked "already placed" — blocks were skipped and
+-- the progress counter inflated. We query a tiny 1-stud probe at the center,
+-- then require both position AND size to match within tolerance.
+pwb.findBlockAt = function(centerPos, bsize)
+    if not pwb.cfolder or not pwb.cfolder.Parent then return nil end
+    local size = bsize or Vector3.new(pwb.gridSize, pwb.gridSize, pwb.gridSize)
+
+    local params = OverlapParams.new()
+    params.FilterType = Enum.RaycastFilterType.Include
+    params.FilterDescendantsInstances = { pwb.cfolder }
+    params.MaxParts = 12
+
+    -- Probe box is small (1 stud) and centered exactly on the slot, so it only
+    -- catches parts that actually sit on this grid cell.
+    local hits = workspace:GetPartBoundsInBox(CFrame.new(centerPos), Vector3.new(1, 1, 1), params)
+    if not hits then return nil end
+    for _, part in ipairs(hits) do
+        if part:IsA("BasePart")
+            and pwb.vecClose(part.Position, centerPos, pwb.POS_TOLERANCE)
+            and pwb.vecClose(part.Size, size, pwb.SIZE_TOLERANCE)
+        then
+            return part
+        end
+    end
+    return nil
+end
+
+-- Check if the exact block (slot + size) already exists. Only a TRUE exact-slot
+-- match counts. Intentionally retained as a clean primitive even though the
+-- build loop now calls pwb.blockVerified (which also checks color/material);
+-- keep for cheap presence-only checks / future use.
+pwb.blockAlreadyPlaced = function(rawPos, bsize)
+    return pwb.findBlockAt(pwb.blockCenter(rawPos, bsize), bsize) ~= nil
+end
+
+-- Fully verify a placed block matches the manifest: present, right size, right
+-- color, right material. Returns true only if everything lines up. `centerPos`
+-- is the EXPECTED world center of the placed part (computed by the caller, which
+-- knows whether the manifest stored p as a center or a corner). `expectMat` is
+-- an Enum.Material (already resolved from the manifest's short name).
+pwb.blockVerified = function(centerPos, bsize, expectColor, expectMat)
+    local part = pwb.findBlockAt(centerPos, bsize)
+    if not part then return false end
+    if expectColor and not pwb.colorClose(part.Color, expectColor) then
+        return false
+    end
+    if expectMat and part.Material ~= expectMat then
+        return false
+    end
+    return true
+end
+
+-- SHAPE pass, extracted from pwb.buildblock. Resizes the just-placed cube
+-- (pwb.childcube) to bsizev3 along each axis via the Shape tool. Pulled out so
+-- pwb.buildblock stays under Luau's hard 200-register-per-function limit — the
+-- resizeAxis closure + its loop were the heaviest contributor.
+pwb.shapePass = function(pos, bsizev3, needsresize)
+    if not (pwb.childcube
+        and ((bsizev3 ~= nil and (bsizev3.X ~= pwb.gridSize or bsizev3.Y ~= pwb.gridSize or bsizev3.Z ~= pwb.gridSize)) or needsresize == true)
+        and (LocalPlayer.Character:FindFirstChild("Shape") or LocalPlayer.Backpack:FindFirstChild("Shape"))) then
+        return
+    end
+    if not LocalPlayer.Character:FindFirstChild("Shape") and LocalPlayer.Backpack:FindFirstChild("Shape") then
+        LocalPlayer.Backpack.Shape.Parent = LocalPlayer.Character
+    end
+    local args = { [1] = pwb.childcube, [2] = Enum.NormalId.Right, [3] = "", [4] = "" }
+    local function resizeAxis(axisName, faceEnum, targetN)
+        args[2] = faceEnum
+        local c = 0
+        if pwb.childcube and pwb.childcube.Size[axisName] ~= targetN then
+            repeat
+                c = c + 1
+                local pp = (pwb.childcube and pwb.childcube.Position + pwb.childcube.Size / 2) or pos
+                args[4] = nil
+                if pwb.childcube then
+                    args[3] = pp
+                    if pwb.childcube.Size[axisName] > targetN then args[4] = "decrease"
+                    elseif pwb.childcube.Size[axisName] < targetN then args[4] = "increase" end
+                end
+                if LocalPlayer.Character:FindFirstChild("Shape") then
+                    local _ = (LocalPlayer.Character.Shape:FindFirstChild("origevent") and LocalPlayer.Character.Shape.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Shape.Script.Event:FireServer(unpack(args))
+                end
+                task.wait(pwb.resizewait)
+            until args[4] == nil or (args[4] == "decrease" and pwb.childcube and pwb.childcube.Size[axisName] <= 1) or (pwb.childcube and pwb.childcube.Size[axisName] == targetN) or pwb.stopped == true or pwb.skipblock == true or not pwb.childcube or not pwb.childcube.Parent or c > (targetN * 3) / pwb.resizewait
+        end
+    end
+    resizeAxis("X", Enum.NormalId.Right, bsizev3.X)
+    resizeAxis("Y", Enum.NormalId.Top,   bsizev3.Y)
+    resizeAxis("Z", Enum.NormalId.Back,  bsizev3.Z)
+end
+
+-- The big one: buildblock, ported essentially verbatim from pealzware. The
+-- only meaningful changes are state lookups (`pwb.X` instead of `X`) and
+-- using LocalPlayer directly. The remote/event calls are unchanged because
+-- the game's Build/Paint/Shape tools live on every player including bots.
+pwb.buildblock = function(pos, texture, color, bsize, bsizev3, premadebuild, origmaterial, sprays, anchored, collide)
+    if anchored == nil then anchored = true end
+    if collide == nil then collide = true end
+    local needsresize = false
+
+    pcall(function()
+        local s, e = pcall(function()
+            LocalPlayer.Backpack.Build.Parent = LocalPlayer.Character
+        end)
+
+        local oo = false
+        local c = 0
+        pwb.childcube = nil
+
+        if #pwb.cubehistory > 0 and pwb.oldprt then
+            local allooslol = {}
+            for i, childcube2 in pairs(pwb.cubehistory) do
+                if childcube2 == nil or childcube2.Parent == nil then
+                    pwb.cubehistory[i] = nil
+                    continue
+                elseif pwb.oldprt.Size == childcube2.Size then
+                    for idx, v in pairs(pwb.normalids) do
+                        local p2 = childcube2.Position + (v[1] * childcube2.Size[v[2]])
+                        if p2 == pwb.oldprt.Position then
+                            oo = {idx, childcube2, childcube2.Position + (v[1] * childcube2.Size[v[2]]/2)}
+                            table.insert(allooslol, {idx, childcube2, childcube2.Position + (v[1] * childcube2.Size[v[2]]/2)})
+                        end
+                    end
+                end
+            end
+            if #allooslol > 1 and color and oo and oo[2] and oo[2].Color ~= color then
+                for _, v in pairs(allooslol) do
+                    if v[2].Color == color then oo = v end
+                end
+            end
+            local origposs = pos
+            if oo and oo[2] ~= nil and oo[2].Parent ~= nil then
+                local args = { [1] = oo[2], [2] = oo[1], [3] = oo[3] or pwb.oldprt.Position, [4] = "normal" }
+                pwb.built = false
+                pwb.childcube = nil
+                c = 0
+                repeat
+                    c = c + 1
+                    if LocalPlayer.Character:FindFirstChild("Build") then
+                        local _ = (LocalPlayer.Character.Build:FindFirstChild("origevent") and LocalPlayer.Character.Build.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Build.Script.Event:FireServer(unpack(args))
+                    else
+                        pcall(function()
+                            LocalPlayer.Backpack.Build.Parent = LocalPlayer.Character
+                        end)
+                    end
+                    pcall(function()
+                        pos = oo[3] or pos
+                        if pwb.tp and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                            LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(pos)
+                        end
+                    end)
+                    -- Guaranteed yield: lets the cfolder ChildAdded fire (so
+                    -- pwb.built can flip true) and keeps stop responsive even
+                    -- when the FireServer path (no Invoke yield) is taken.
+                    RunService.Heartbeat:Wait()
+                until (pwb.built == true and pwb.childcube) or oo[2] == nil or oo[2].Parent == nil or pwb.stopped == true or pwb.skipblock == true or c > 40
+                if oo[2] == nil or oo[2].Parent == nil or c > 40 then
+                    oo = false
+                else
+                    if pwb.oldprt then pwb.oldprt:Destroy() end
+                end
+            end
+            pos = origposs
+        end
+
+        if oo == false then
+            if bsize == nil then
+                bsize = "normal"
+                if LocalPlayer.PlayerGui:FindFirstChild("Build") and LocalPlayer.PlayerGui.Build:FindFirstChild("Button") then
+                    bsize = LocalPlayer.PlayerGui.Build.Button.Text
+                end
+                if bsizev3 ~= nil and (bsizev3.X ~= pwb.gridSize or bsizev3.Y ~= pwb.gridSize or bsizev3.Z ~= pwb.gridSize) then
+                    bsize = "detailed"
+                elseif bsizev3 ~= nil and (bsizev3.X == pwb.gridSize and bsizev3.Y == pwb.gridSize and bsizev3.Z == pwb.gridSize) then
+                    bsize = "normal"
+                end
+                if bsizev3 == nil and (bsize ~= "detailed") and pwb.oldprt and pwb.oldprt.Position ~= pwb.snap(pos) then
+                    bsize = "detailed"
+                    needsresize = true
+                    bsizev3 = Vector3.new(4, 4, 4)
+                    pos = Vector3.new((pos.X - (bsizev3.X/2))+.5, (pos.Y - (bsizev3.Y/2))+.5, (pos.Z - (bsizev3.Z/2))+.5)
+                end
+            end
+            pos = pwb.snap(pos)
+            local args = { [1] = workspace.Terrain, [2] = Enum.NormalId.Top, [3] = pos, [4] = bsize or "normal" }
+            pwb.built = false
+            pcall(function()
+                local _ = (LocalPlayer.Character.Build:FindFirstChild("origevent") and LocalPlayer.Character.Build.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Build.Script.Event:FireServer(unpack(args))
+            end)
+            c = 0
+            repeat
+                c = c + 1
+                if LocalPlayer.Character and not LocalPlayer.Character:FindFirstChild("Build") and LocalPlayer.Backpack:FindFirstChild("Build") then
+                    LocalPlayer.Backpack.Build.Parent = LocalPlayer.Character
+                end
+                if LocalPlayer.Character:FindFirstChild("Build") then
+                    local _ = (LocalPlayer.Character.Build:FindFirstChild("origevent") and LocalPlayer.Character.Build.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Build.Script.Event:FireServer(unpack(args))
+                end
+                pcall(function()
+                    if pwb.tp and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                        LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(pos + Vector3.new(0, 6, 0))
+                    end
+                end)
+                -- Guaranteed yield (see oo loop above) — without this the
+                -- FireServer path spins 150x in one frame, ChildAdded never
+                -- fires, pwb.built stays false, and the block silently fails.
+                RunService.Heartbeat:Wait()
+            until (pwb.built == true and pwb.childcube) or pwb.stopped == true or pwb.skipblock == true or c > 150
+            pwb.built = false
+            c = 0
+        end
+
+        -- PAINT pass (color / material).
+        if pwb.childcube and typeof(color) == "Color3" and (color ~= pwb.defaultcolor or (pwb.childcube.Color ~= color or pwb.childcube.Material ~= texture)) and (LocalPlayer.Backpack:FindFirstChild("Paint") or LocalPlayer.Character:FindFirstChild("Paint")) and ((pwb.colorbool and premadebuild ~= nil) or not pwb.colorbool) or texture then
+            local pp = (pwb.childcube and pwb.childcube.Position + pwb.childcube.Size/2) or pos
+            local args = { [1] = pwb.childcube, [2] = Enum.NormalId.Top, [3] = pp, [4] = "color", [5] = color or nil, [6] = "tiles", [7] = "" }
+            pcall(function() LocalPlayer.Backpack.Paint.Parent = LocalPlayer.Character end)
+            if texture ~= nil then
+                if color == nil then args[4] = "material" else args[4] = "both \u{1F91D}" end
+                args[6] = texture
+            end
+            if not pwb.childcube then
+                if pwb.oldprt then pwb.oldprt:Destroy() end
+                return
+            end
+            c = 0
+            pcall(function()
+                repeat
+                    c = c + 1
+                    if LocalPlayer.Character and not LocalPlayer.Character:FindFirstChild("Paint") and LocalPlayer.Backpack:FindFirstChild("Paint") then
+                        LocalPlayer.Backpack.Paint.Parent = LocalPlayer.Character
+                    end
+                    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Paint") then
+                        local _ = (LocalPlayer.Character.Paint:FindFirstChild("origevent") and LocalPlayer.Character.Paint.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Paint.Script.Event:FireServer(unpack(args))
+                    end
+                    pcall(function()
+                        if pwb.tp and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                            LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(pp + Vector3.new(0, 6, 0))
+                        end
+                    end)
+                    -- Guaranteed yield. Also caps at 250 frames (~4s) instead of
+                    -- 2000: with the yield the paint replicates within a few
+                    -- frames, so the old 2000 cap only ever meant a multi-second
+                    -- stall per stubborn block on huge builds.
+                    RunService.Heartbeat:Wait()
+                until not pwb.childcube or not pwb.childcube.Parent or pwb.childcube.Color == color or (texture and pwb.childcube.Material == Enum.Material[origmaterial]) or pwb.stopped == true or pwb.skipblock == true or c > 250
+            end)
+        end
+
+        -- ANCHOR + COLLIDE passes (only if Paint tool present and divergence).
+        if pwb.childcube and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Paint") and pwb.childcube.Anchored ~= anchored then
+            local pp = (pwb.childcube and pwb.childcube.Position + pwb.childcube.Size/2) or pos
+            local args = { [1] = pwb.childcube, [2] = Enum.NormalId.Top, [3] = pp or pwb.childcube.Position + Vector3.new(1, 0, 0), [4] = "material", [5] = nil, [6] = "anchor", [7] = "" }
+            c = 0
+            repeat
+                c = c + 1
+                if LocalPlayer.Character:FindFirstChild("Paint") then
+                    local _ = (LocalPlayer.Character.Paint:FindFirstChild("origevent") and LocalPlayer.Character.Paint.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Paint.Script.Event:FireServer(unpack(args))
+                end
+                task.wait(0.15)
+            until not pwb.childcube or not pwb.childcube.Parent or pwb.childcube.Anchored == anchored or pwb.stopped == true or pwb.skipblock == true or c > 12
+        end
+
+        if pwb.childcube and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Paint") and pwb.childcube.CanCollide ~= collide then
+            local pp = (pwb.childcube and pwb.childcube.Position + pwb.childcube.Size/2) or pos
+            local args = { [1] = pwb.childcube, [2] = Enum.NormalId.Top, [3] = pp or pwb.childcube.Position + Vector3.new(1, 0, 0), [4] = "material", [5] = nil, [6] = "collide", [7] = "" }
+            c = 0
+            repeat
+                c = c + 1
+                if LocalPlayer.Character:FindFirstChild("Paint") then
+                    local _ = (LocalPlayer.Character.Paint:FindFirstChild("origevent") and LocalPlayer.Character.Paint.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Paint.Script.Event:FireServer(unpack(args))
+                end
+                task.wait(0.15)
+            until not pwb.childcube or not pwb.childcube.Parent or pwb.childcube.CanCollide == collide or pwb.stopped == true or pwb.skipblock == true or c > 12
+        end
+
+        -- SPRAY pass.
+        if pwb.childcube and (LocalPlayer.Backpack:FindFirstChild("Paint") or LocalPlayer.Character:FindFirstChild("Paint")) and sprays ~= nil then
+            local args = { [1] = pwb.childcube, [2] = Enum.NormalId.Front, [3] = pwb.childcube.Position + Vector3.new(1, 0, 0), [4] = "material", [5] = nil, [6] = "spray", [7] = "ha" }
+            for _, v in pairs(sprays) do
+                args[2] = Enum.NormalId[v[1]]
+                local payload = v[3]
+                if (payload == nil or payload == "") and type(v[2]) == "string" and v[2] ~= "" then
+                    payload = v[2]
+                end
+                args[7] = payload or ""
+                if pwb.childcube and (LocalPlayer.Backpack:FindFirstChild("Paint") or LocalPlayer.Character:FindFirstChild("Paint")) and pwb.stopped == false and pwb.skipblock == false then
+                    pcall(function() LocalPlayer.Backpack.Paint.Parent = LocalPlayer.Character end)
+                    pcall(function()
+                        task.wait(.25)
+                        local _ = (LocalPlayer.Character.Paint:FindFirstChild("origevent") and LocalPlayer.Character.Paint.origevent:Invoke(unpack(args))) or LocalPlayer.Character.Paint.Script.Event:FireServer(unpack(args))
+                    end)
+                end
+            end
+        end
+
+        -- SHAPE pass (only if detailed size mismatch + Shape tool). Extracted to
+        -- pwb.shapePass to keep this function within the register limit.
+        pwb.shapePass(pos, bsizev3, needsresize)
+
+        pwb.skipblock = false
+    end)
+
+    if pwb.oldprt then pwb.oldprt:Destroy() end
+    pwb.childcube = nil
+end
+
+-- File names for cross-bot coordination.
+local PEALZ_MANIFEST_FILE = "PealzBuildManifest.json"
+pwb.progressFile = function()
+    return "PealzBuildProgress_" .. tostring(LocalPlayer.UserId) .. ".json"
+end
+
+pwb.writeProgress = function()
+    if not hasCommandBus or not hasCommandBus() then return end
+    local now = os.clock()
+    if now - pwb.lastProgressWrite < 0.5 then return end
+    pwb.lastProgressWrite = now
+
+    pcall(function()
+        writefile(pwb.progressFile(), HttpService:JSONEncode({
+            botUserId = LocalPlayer.UserId,
+            botName = LocalPlayer.Name,
+            manifestId = pwb.currentManifestId,
+            completed = pwb.completedCount,
+            total = pwb.totalCount,
+            ts = os.time(),
+        }))
+    end)
+end
+
+-- The actual per-bot build loop. Invoked when a `.build start <id>` arrives.
+pwbRunBuildSlice = function(manifestId)
+    if not isBot then return end
+    if not pwb.detectCFolder() then
+        displayLocalMessage("Build aborted: workspace has no Cubes/Bricks folder.", Color3.fromRGB(220, 80, 80))
+        return
+    end
+    if pwb.enabled then
+        displayLocalMessage("Build already running; ignoring start.", Color3.fromRGB(220, 170, 80))
+        return
+    end
+
+    local manifestRaw
+    local readOk = pcall(function()
+        manifestRaw = readfile(PEALZ_MANIFEST_FILE)
+    end)
+    if not readOk or not manifestRaw or manifestRaw == "" then
+        displayLocalMessage("Build manifest missing.", Color3.fromRGB(220, 80, 80))
+        return
+    end
+
+    local decodeOk, manifest = pcall(function()
+        return HttpService:JSONDecode(manifestRaw)
+    end)
+    if not decodeOk or type(manifest) ~= "table" or type(manifest.blocks) ~= "table" then
+        displayLocalMessage("Build manifest malformed.", Color3.fromRGB(220, 80, 80))
+        return
+    end
+
+    if manifestId and manifest.id ~= manifestId then
+        displayLocalMessage("Build manifest id mismatch.", Color3.fromRGB(220, 170, 80))
+        return
+    end
+
+    pwb.startCubeTracker()
+
+    local blocks = pwb.sortBlocksByDistanceFromSpawn(manifest.blocks)
+    local roster = getBotRoster()
+    local myIndex = getLocalBotIndex(roster) or 1
+    local botCount = math.max(#roster, 1)
+
+    -- pealzware build transform (rotation/offset/center). Absent on legacy
+    -- manifests → identity, so old builds place at raw coordinates exactly as
+    -- before. The owner GUI populates manifest.rot {degX,degY,degZ} and
+    -- manifest.off {x,y,z}.
+    local rot = manifest.rot
+    local rotCF = (type(rot) == "table" and (rot[1] ~= 0 or rot[2] ~= 0 or rot[3] ~= 0))
+        and CFrame.Angles(math.rad(rot[1] or 0), math.rad(rot[2] or 0), math.rad(rot[3] or 0))
+        or nil
+    local off = manifest.off
+    local offset = (type(off) == "table") and Vector3.new(off[1] or 0, off[2] or 0, off[3] or 0) or nil
+    local buildCenter = (rotCF or offset) and pwb.computeBuildCenter(blocks) or nil
+
+    -- Resolve a single manifest entry into the concrete values we place: the
+    -- corner-anchored world position (after transform), size, color, material.
+    local function resolveBlock(v)
+        local posses = v.p or v.pos
+        if not posses then return nil end
+        local sizeArr = v.s or v.size
+        local bsz = sizeArr and Vector3.new(table.unpack(sizeArr)) or Vector3.new(pwb.gridSize, pwb.gridSize, pwb.gridSize)
+        local rawPos = Vector3.new(posses[1], posses[2], posses[3])
+        local pos = pwb.transformBlockPos(rawPos, bsz, buildCenter, rotCF, offset)
+        local col = (v.c or v.color) and Color3.fromRGB(table.unpack(v.c or v.color)) or pwb.defaultcolor
+        local mat = v.m or v.mat
+        -- Verification center = where the placed part's .Position lands. saveblock
+        -- stores STANDARD (gridSize) blocks with p = the center and NO size field;
+        -- NON-standard blocks store p = corner (center - size/2 + 0.5). So only
+        -- apply the corner->center offset when the manifest actually carried a size
+        -- — otherwise p IS already the center. (This was the 0/16 bug: every
+        -- standard block was probed ~1.5 studs off and never matched.)
+        local center = pos
+        if sizeArr then
+            center = Vector3.new(
+                pos.X + (bsz.X / 2) - 0.5,
+                pos.Y + (bsz.Y / 2) - 0.5,
+                pos.Z + (bsz.Z / 2) - 0.5)
+        end
+        return pos, bsz, col, mat, center
+    end
+
+    -- Build this bot's slice list up front so the verify pass can re-walk it.
+    local myBlocks = {}
+    for i, v in ipairs(blocks) do
+        if ((i - 1) % botCount) + 1 == myIndex then
+            myBlocks[#myBlocks + 1] = v
+        end
+    end
+
+    -- Run generation: bumping this invalidates any still-winding-down thread
+    -- from a previous start (stop → quick reload) so two builds never share the
+    -- pwb.childcube/oldprt scratch state at once.
+    pwb.runGen = (pwb.runGen or 0) + 1
+    local myGen = pwb.runGen
+
+    pwb.enabled = true
+    pwb.stopped = false
+    pwb.skipblock = false
+    pwb.currentManifestId = manifest.id
+    pwb.totalCount = #blocks
+    pwb.completedCount = 0
+    pwb.placedThisRun = {}
+    pwb.writeProgress()
+
+    -- Place (or re-place) one manifest entry. Returns true once the block is
+    -- verified present with the right size/color/material.
+    local function placeAndVerify(v)
+        local pos, bsz, col, mat, center = resolveBlock(v)
+        if not pos then return true end -- malformed entry: nothing to place, don't block progress
+        local expectMat = pwb.swappedmaterials[mat] or Enum.Material.SmoothPlastic
+
+        if pwb.blockVerified(center, bsz, col, expectMat) then
+            return true
+        end
+
+        -- Make sure we still hold the build kit before each attempt.
+        pwb.ensureBuildTools(true)
+
+        pwb.createpartrepl(pos, bsz, col, expectMat)
+        pwb.buildblock(pos, mat, col, nil, bsz, true, v.o or v.origmat, v.sp or v.sprayed, v.a or v.anchored, v.cc or v.collide)
+
+        return pwb.blockVerified(center, bsz, col, expectMat)
+    end
+
+    trackThread(task.spawn(function()
+        -- Let any prior run's in-flight buildblock finish so it doesn't fight us
+        -- over the shared scratch state; its pass-loop sees the new runGen and
+        -- exits.
+        task.wait(0.2)
+        if pwb.runGen ~= myGen then return end
+
+        -- Hard gate: no build kit, no build. Notify the owner and bail cleanly.
+        if not pwb.ensureBuildTools(true) then
+            pwb.enabled = false
+            pwb.writeProgress()
+            return
+        end
+
+        local placed = {}        -- index in myBlocks -> verified bool
+        local verifiedCount = 0
+        local function aborted()
+            return pwb.stopped or not Controller.running or pwb.runGen ~= myGen
+        end
+
+        -- ---- PASS 1: place each claimed block ----
+        for i, v in ipairs(myBlocks) do
+            if aborted() then break end
+            if i % 25 == 0 then pwb.ensureBuildTools(false) end
+
+            local ok = placeAndVerify(v)
+            placed[i] = ok
+            if ok then
+                verifiedCount = verifiedCount + 1
+                pwb.completedCount = verifiedCount
+                pwb.writeProgress()
+            end
+        end
+
+        -- ---- VERIFY / REPAIR PASSES ----
+        -- Re-walk anything that didn't verify. Blocks can fail the first time
+        -- when the cfolder ChildAdded races, a neighbour shifted the snap, or
+        -- the tool was momentarily gone. Retry a bounded number of times.
+        local repairPass = 0
+        while not aborted() and verifiedCount < #myBlocks and repairPass < 4 do
+            repairPass = repairPass + 1
+            local repairedThisPass = 0
+            for i, v in ipairs(myBlocks) do
+                if aborted() then break end
+                if not placed[i] then
+                    if placeAndVerify(v) then
+                        placed[i] = true
+                        verifiedCount = verifiedCount + 1
+                        repairedThisPass = repairedThisPass + 1
+                        pwb.completedCount = verifiedCount
+                        pwb.writeProgress()
+                    end
+                end
+            end
+            -- No progress this pass → remaining blocks are unplaceable (e.g.
+            -- the slot is blocked by foreign geometry). Stop hammering.
+            if repairedThisPass == 0 then break end
+        end
+
+        pwb.enabled = false
+        pwb.writeProgress()
+
+        local missing = #myBlocks - verifiedCount
+        if missing > 0 then
+            displayLocalMessage(
+                string.format("Build slice: %d / %d placed (%d could not be verified).",
+                    verifiedCount, #myBlocks, missing),
+                Color3.fromRGB(220, 170, 80))
+        else
+            displayLocalMessage(string.format("Build slice complete & verified: %d / %d.", verifiedCount, #myBlocks))
+        end
+    end))
+end
+
+pwbStopBuild = function()
+    pwb.stopped = true
+    pwb.skipblock = true
+    pwb.enabled = false
+    -- Invalidate the running thread's generation so it exits at the next block
+    -- boundary even if a new build is started immediately after.
+    pwb.runGen = (pwb.runGen or 0) + 1
+    pwb.writeProgress()
+end
+
+-- ------------ OWNER-SIDE GUI + DISPATCH ------------
+-- Only the controlling player (0pealz) shows the GUI. Bots ignore.
+local pwbGuiState = { lastStatusUpdate = 0 }
+
+pwbAggregateProgress = function()
+    if not hasCommandBus or not hasCommandBus() then return 0, 0, 0 end
+    local total, completed, botsSeen = 0, 0, 0
+    local seen = {}
+
+    pcall(function()
+        local files = (listfiles and listfiles("")) or {}
+        for _, fpath in ipairs(files) do
+            local base = fpath:match("([^/\\]+)$") or fpath
+            if base:sub(1, #"PealzBuildProgress_") == "PealzBuildProgress_" then
+                local ok, raw = pcall(readfile, fpath)
+                if ok and type(raw) == "string" and raw ~= "" then
+                    local decodedOk, data = pcall(function() return HttpService:JSONDecode(raw) end)
+                    if decodedOk and type(data) == "table" and data.manifestId == pwb.currentManifestId and not seen[data.botUserId] then
+                        seen[data.botUserId] = true
+                        botsSeen = botsSeen + 1
+                        completed = completed + (tonumber(data.completed) or 0)
+                        total = math.max(total, tonumber(data.total) or 0)
+                    end
+                end
+            end
+        end
+    end)
+
+    return completed, total, botsSeen
+end
+
+local function remoteRequest(path, body)
+    if not REMOTE_CONTROL_ENABLED then
+        return nil, "remote disabled"
+    end
+
+    local requestFunction = getHttpRequestFunction()
+    if not requestFunction then
+        if not state.remoteUnavailableNotified then
+            state.remoteUnavailableNotified = true
+            displayLocalMessage("HTTPS remote unavailable: executor has no request/http_request.", Color3.fromRGB(220, 170, 80))
+        end
+
+        return nil, "no request function"
+    end
+
+    local requestBody = nil
+    if body ~= nil then
+        local ok, encoded = pcall(function()
+            return HttpService:JSONEncode(body)
+        end)
+
+        if not ok then
+            return nil, "json encode failed"
+        end
+
+        requestBody = encoded
+    end
+
+    local ok, response = pcall(function()
+        return requestFunction({
+            Url = REMOTE_CONTROL_BASE_URL .. "/" .. path,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["x-master-key"] = REMOTE_CONTROL_KEY,
+            },
+            Body = requestBody or "{}",
+        })
+    end)
+
+    if not ok then
+        if not state.remoteUnavailableNotified then
+            state.remoteUnavailableNotified = true
+            displayLocalMessage("HTTPS remote failed: " .. string.sub(tostring(response), 1, 80), Color3.fromRGB(220, 170, 80))
+        end
+
+        return nil, tostring(response)
+    end
+
+    local statusCode = nil
+    local responseBody = nil
+
+    if type(response) == "table" then
+        statusCode = response.StatusCode or response.Status or response.status
+        responseBody = response.Body or response.body or response.ResponseBody
+    elseif type(response) == "string" then
+        responseBody = response
+    end
+
+    if statusCode and tonumber(statusCode) and tonumber(statusCode) >= 400 then
+        return nil, "http " .. tostring(statusCode)
+    end
+
+    if type(responseBody) ~= "string" or responseBody == "" then
+        return {}
+    end
+
+    local decodedOk, decoded = pcall(function()
+        return HttpService:JSONDecode(responseBody)
+    end)
+
+    if not decodedOk then
+        return nil, "json decode failed"
+    end
+
+    return decoded
+end
+
+local processCommand
+function publishCommandToRemote(message, fromRemote)
+    if fromRemote or not REMOTE_CONTROL_ENABLED then
+        return
+    end
+
+    message = tostring(message or "")
+    if not getCommandPrefix(message) then
+        return
+    end
+
+    task.spawn(function()
+        remoteRequest("command", {
+            command = message,
+        })
+    end)
+end
+
+-- opts: { rot = {degX, degY, degZ}, off = {x, y, z} } (both optional).
+local function pwbDispatchBuild(jsonText, opts)
+    if not hasCommandBus or not hasCommandBus() then
+        displayLocalMessage("Build dispatch needs file IO (readfile/writefile).", Color3.fromRGB(220, 80, 80))
+        return false
+    end
+    if type(jsonText) ~= "string" or jsonText == "" then
+        displayLocalMessage("Paste build JSON first.", Color3.fromRGB(220, 170, 80))
+        return false
+    end
+
+    local ok, blocks = pcall(function() return HttpService:JSONDecode(jsonText) end)
+    if not ok or type(blocks) ~= "table" or #blocks == 0 then
+        displayLocalMessage("Build JSON invalid or empty.", Color3.fromRGB(220, 80, 80))
+        return false
+    end
+
+    opts = opts or {}
+    local manifestId = HttpService:GenerateGUID(false)
+    local manifest = {
+        id = manifestId,
+        owner = OWNER_USER_ID,
+        ts = os.time(),
+        blocks = blocks,
+        totalBlocks = #blocks,
+        rot = opts.rot,
+        off = opts.off,
+    }
+
+    local writeOk = pcall(function()
+        writefile(PEALZ_MANIFEST_FILE, HttpService:JSONEncode(manifest))
+    end)
+    if not writeOk then
+        displayLocalMessage("Failed to write manifest.", Color3.fromRGB(220, 80, 80))
+        return false
+    end
+
+    -- Clear any stale per-bot progress files for clean status display.
+    pcall(function()
+        local files = (listfiles and listfiles("")) or {}
+        for _, fpath in ipairs(files) do
+            local base = fpath:match("([^/\\]+)$") or fpath
+            if base:sub(1, #"PealzBuildProgress_") == "PealzBuildProgress_" then
+                pcall(function() delfile(fpath) end)
+            end
+        end
+    end)
+
+    pwb.currentManifestId = manifestId
+    pwb.totalCount = #blocks
+    pwb.completedCount = 0
+
+    -- Publish via the command bus so every bot picks it up.
+    publishCommandToBus(".build start " .. manifestId)
+    publishCommandToRemote(".build start " .. manifestId)
+    displayLocalMessage(string.format("Build dispatched: %d blocks across bots.", #blocks))
+    return true
+end
+
+-- Re-issue the CURRENT manifest so bots re-walk and place only the blocks that
+-- aren't verified yet (dedup skips the ones already correct). This is the
+-- "Verify & Repair" action — no manifest rewrite, no progress reset.
+local function pwbDispatchVerify()
+    if not pwb.currentManifestId then
+        displayLocalMessage("No build to verify yet.", Color3.fromRGB(220, 170, 80))
+        return false
+    end
+    publishCommandToBus(".build start " .. pwb.currentManifestId)
+    publishCommandToRemote(".build start " .. pwb.currentManifestId)
+    displayLocalMessage("Re-verifying build — bots will repair any missing blocks.")
+    return true
+end
+
+-- ------------ OWNER-SIDE BKIT GRANT ------------
+-- Read any player's "Time" leaderstat as a number (0 if absent).
+local function pwbPlayerTime(player)
+    local ls = player and player:FindFirstChild("leaderstats")
+    if not ls then return 0 end
+    local t = ls:FindFirstChild("Time")
+    if not t then
+        for _, s in ipairs(ls:GetChildren()) do
+            if string.lower(s.Name) == "time" then t = s break end
+        end
+    end
+    if not t then return 0 end
+    return tonumber((tostring(t.Value):gsub(",", ""))) or 0
+end
+
+-- The owner is "admin" when they hold the highest Time in the server (the game
+-- grants admin / bkit-granting rights to the top-Time player). Ties count as
+-- admin so we don't needlessly equip the tool.
+local function pwbOwnerIsAdmin()
+    local mine = pwbPlayerTime(LocalPlayer)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and pwbPlayerTime(p) > mine then
+            return false
+        end
+    end
+    return true
+end
+
+-- Grant the build kit to all bots. If we're not already admin, equip the
+-- admin-granting tool first (Arkenstone, or Enlighten on some games) so the
+-- ;bkit command is allowed; if we're already top-Time we skip that and just
+-- chat the grant. Bots all share BOT_KEYWORD in their name, so one partial-name
+-- ;bkit hits every bot at once. Returns once the grant has been chatted.
+local function pwbGrantBkitToBots()
+    if not pwbOwnerIsAdmin() then
+        if not pwb.equipTool("The Arkenstone") then
+            pwb.equipTool("Arkenstone")
+        end
+        task.wait(0.4) -- let the admin tool's powers register before granting
+    end
+    sendChatMessageNow(";bkit " .. BOT_KEYWORD)
+end
+
+pwbBuildGuiCreate = function()
+    if pwbGui and pwbGui.Parent then return end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "PealzBotBuildPanel"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+    sg.Parent = parent
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Root"
+    frame.Size = UDim2.new(0, 380, 0, 488)
+    frame.Position = UDim2.new(0.5, -190, 0, 50)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = sg
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Color = Color3.fromRGB(60, 60, 70)
+    stroke.Parent = frame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 8)
+    corner.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.BackgroundTransparency = 1
+    title.Size = UDim2.new(1, -40, 0, 32)
+    title.Position = UDim2.new(0, 12, 0, 6)
+    title.Text = "pealz .build — multi-bot"
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 15
+    title.TextColor3 = Color3.fromRGB(230, 230, 240)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 28, 0, 24)
+    closeBtn.Position = UDim2.new(1, -34, 0, 8)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 46)
+    closeBtn.Text = "×"
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 16
+    closeBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    closeBtn.Parent = frame
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -24, 0, 180)
+    scroll.Position = UDim2.new(0, 12, 0, 44)
+    scroll.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+    scroll.BorderSizePixel = 0
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollBarThickness = 4
+    scroll.Parent = frame
+    Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
+
+    local input = Instance.new("TextBox")
+    input.Name = "JsonInput"
+    input.Size = UDim2.new(1, -8, 0, 800)
+    input.Position = UDim2.new(0, 4, 0, 4)
+    input.BackgroundTransparency = 1
+    input.TextColor3 = Color3.fromRGB(210, 210, 220)
+    input.Font = Enum.Font.Code
+    input.TextSize = 12
+    input.TextXAlignment = Enum.TextXAlignment.Left
+    input.TextYAlignment = Enum.TextYAlignment.Top
+    input.TextWrapped = true
+    input.MultiLine = true
+    input.ClearTextOnFocus = false
+    input.PlaceholderText = "Paste build JSON here (e.g. exported from .build save)"
+    input.Text = ""
+    input.Parent = scroll
+
+    -- ---- Transform row: rotation (degrees) + offset (studs) ----
+    local function mkAxisLabel(text, y)
+        local l = Instance.new("TextLabel")
+        l.BackgroundTransparency = 1
+        l.Size = UDim2.new(0, 44, 0, 24)
+        l.Position = UDim2.new(0, 12, 0, y)
+        l.Text = text
+        l.Font = Enum.Font.GothamSemibold
+        l.TextSize = 12
+        l.TextColor3 = Color3.fromRGB(170, 175, 190)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.Parent = frame
+        return l
+    end
+
+    -- Returns the TextBox so handlers can read it.
+    local function mkNumBox(x, y, placeholder)
+        local b = Instance.new("TextBox")
+        b.Size = UDim2.new(0, 90, 0, 24)
+        b.Position = UDim2.new(0, x, 0, y)
+        b.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+        b.TextColor3 = Color3.fromRGB(215, 215, 225)
+        b.PlaceholderText = placeholder
+        b.PlaceholderColor3 = Color3.fromRGB(90, 90, 100)
+        b.Text = ""
+        b.Font = Enum.Font.Code
+        b.TextSize = 12
+        b.ClearTextOnFocus = false
+        b.Parent = frame
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+        return b
+    end
+
+    mkAxisLabel("Rot°", 230)
+    local rotX = mkNumBox(58,  230, "X 0")
+    local rotY = mkNumBox(152, 230, "Y 0")
+    local rotZ = mkNumBox(246, 230, "Z 0")
+    mkAxisLabel("Off", 258)
+    local offX = mkNumBox(58,  258, "X 0")
+    local offY = mkNumBox(152, 258, "Y 0")
+    local offZ = mkNumBox(246, 258, "Z 0")
+
+    -- Read the transform boxes into a manifest opts table. Blank = 0; identity
+    -- transform passes nil so legacy/no-transform builds stay byte-identical.
+    local function readOpts()
+        local function num(box) return tonumber(box.Text) or 0 end
+        local rx, ry, rz = num(rotX), num(rotY), num(rotZ)
+        local ox, oy, oz = num(offX), num(offY), num(offZ)
+        local opts = {}
+        if rx ~= 0 or ry ~= 0 or rz ~= 0 then opts.rot = { rx, ry, rz } end
+        if ox ~= 0 or oy ~= 0 or oz ~= 0 then opts.off = { ox, oy, oz } end
+        return opts
+    end
+
+    local function mkBtn(text, x, color)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0, 84, 0, 30)
+        b.Position = UDim2.new(0, x, 0, 292)
+        b.BackgroundColor3 = color or Color3.fromRGB(40, 80, 160)
+        b.Text = text
+        b.Font = Enum.Font.GothamSemibold
+        b.TextSize = 12
+        b.TextColor3 = Color3.fromRGB(245, 245, 255)
+        b.AutoButtonColor = true
+        b.Parent = frame
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+        return b
+    end
+
+    local loadBtn   = mkBtn("Load Build", 12,  Color3.fromRGB(40, 110, 200))
+    local verifyBtn = mkBtn("Verify",     103, Color3.fromRGB(150, 110, 40))
+    local stopBtn   = mkBtn("Stop",       194, Color3.fromRGB(180, 60, 60))
+    local saveBtn   = mkBtn("Save",       285, Color3.fromRGB(60, 130, 90))
+
+    -- ---- Progress bar ----
+    local barBg = Instance.new("Frame")
+    barBg.Size = UDim2.new(1, -24, 0, 16)
+    barBg.Position = UDim2.new(0, 12, 0, 330)
+    barBg.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+    barBg.BorderSizePixel = 0
+    barBg.Parent = frame
+    Instance.new("UICorner", barBg).CornerRadius = UDim.new(0, 8)
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = Color3.fromRGB(60, 170, 110)
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barBg
+    Instance.new("UICorner", barFill).CornerRadius = UDim.new(0, 8)
+    local barText = Instance.new("TextLabel")
+    barText.BackgroundTransparency = 1
+    barText.Size = UDim2.new(1, 0, 1, 0)
+    barText.Text = "0%"
+    barText.Font = Enum.Font.GothamSemibold
+    barText.TextSize = 11
+    barText.TextColor3 = Color3.fromRGB(235, 240, 245)
+    barText.Parent = barBg
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.new(1, -24, 0, 104)
+    status.Position = UDim2.new(0, 12, 0, 356)
+    status.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+    status.Font = Enum.Font.Code
+    status.TextSize = 12
+    status.TextColor3 = Color3.fromRGB(190, 200, 210)
+    status.TextWrapped = true
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextYAlignment = Enum.TextYAlignment.Top
+    status.Text = "Idle.\nPaste JSON, set rotation/offset (optional), click Load Build."
+    status.Parent = frame
+    Instance.new("UICorner", status).CornerRadius = UDim.new(0, 6)
+    local statusPad = Instance.new("UIPadding", status)
+    statusPad.PaddingTop = UDim.new(0, 8)
+    statusPad.PaddingLeft = UDim.new(0, 10)
+    statusPad.PaddingRight = UDim.new(0, 10)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        sg.Enabled = false
+    end)
+
+    loadBtn.MouseButton1Click:Connect(function()
+        local opts = readOpts()
+        local text = input.Text
+        status.Text = "Granting build kit to bots (;bkit " .. BOT_KEYWORD .. ")..."
+        task.spawn(function()
+            -- Make sure the bots actually have bkit before dispatching: equip the
+            -- admin tool if we're not already top-Time, chat the grant, then give
+            -- it a moment to land in the bots' backpacks.
+            pwbGrantBkitToBots()
+            task.wait(1.5)
+            status.Text = "Build kit granted. Dispatching build..."
+            pwbDispatchBuild(text, opts)
+        end)
+    end)
+
+    verifyBtn.MouseButton1Click:Connect(function()
+        -- Re-grant bkit too, in case a bot lost its tools since the last load.
+        task.spawn(function()
+            pwbGrantBkitToBots()
+            task.wait(1.0)
+            if pwbDispatchVerify() then
+                status.Text = "Re-verifying — bots will re-place any missing/incorrect blocks."
+            else
+                status.Text = "Nothing to verify yet. Load a build first."
+            end
+        end)
+    end)
+
+    stopBtn.MouseButton1Click:Connect(function()
+        -- Stop the OWNER's own build state immediately (don't wait for the
+        -- file-bus round-trip), then broadcast to the bots.
+        pwbStopBuild()
+        publishCommandToBus(".build stop")
+        publishCommandToRemote(".build stop")
+        status.Text = "Stop signal sent to all bots."
+    end)
+
+    saveBtn.MouseButton1Click:Connect(function()
+        if not pwb.detectCFolder() then
+            status.Text = "No Cubes/Bricks folder in workspace."
+            return
+        end
+        status.Text = "Scanning server blocks..."
+        task.spawn(function()
+            local descendants = pwb.cfolder:GetDescendants()
+            local data = {}
+            for i, d in ipairs(descendants) do
+                if d:IsA("BasePart") then
+                    local ok, blk = pcall(pwb.saveblock, d)
+                    if ok and blk then table.insert(data, blk) end
+                end
+                if i % 250 == 0 then task.wait() end
+            end
+            if #data == 0 then
+                status.Text = "No blocks found on server."
+                return
+            end
+            local encoded = HttpService:JSONEncode(data)
+            input.Text = encoded
+            if setclipboard then pcall(setclipboard, encoded) end
+            status.Text = string.format("Saved %d blocks. JSON in textbox + clipboard.", #data)
+        end)
+    end)
+
+    pwbGui = sg
+
+    -- Live status poller for owner.
+    trackThread(task.spawn(function()
+        while Controller.running and sg.Parent do
+            local now = os.clock()
+            if now - pwbGuiState.lastStatusUpdate > 1 then
+                pwbGuiState.lastStatusUpdate = now
+                if pwb.currentManifestId then
+                    local completed, total, botsSeen = pwbAggregateProgress()
+                    if total > 0 then
+                        local frac = math.clamp(completed / total, 0, 1)
+                        local pct = math.floor(frac * 100)
+                        barFill.Size = UDim2.new(frac, 0, 1, 0)
+                        -- Tint red→amber→green as it fills so a stalled build is
+                        -- obvious at a glance.
+                        barFill.BackgroundColor3 = (pct >= 100)
+                            and Color3.fromRGB(60, 180, 110)
+                            or Color3.fromRGB(70 + math.floor(frac * 80), 140 + math.floor(frac * 30), 90)
+                        barText.Text = string.format("%d%%  (%d / %d)", pct, completed, total)
+                        status.Text = string.format(
+                            "Manifest: %s\nBots reporting: %d\nVerified blocks: %d / %d\n%s",
+                            tostring(pwb.currentManifestId):sub(1, 8),
+                            botsSeen, completed, total,
+                            (completed >= total and total > 0) and "Build complete & verified."
+                                or "Building… (counts only VERIFIED placements)")
+                    end
+                end
+            end
+            task.wait(1)
+        end
+    end))
+end
+
+-- Toggle GUI with a keybind on the owner account.
+if isOwnerAccount then
+    task.spawn(function()
+        -- Wait until PlayerGui exists, then build the panel.
+        LocalPlayer:WaitForChild("PlayerGui", 10)
+        pwbBuildGuiCreate()
+    end)
+
+    track(UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == Enum.KeyCode.RightBracket then
+            if pwbGui and pwbGui.Parent then
+                pwbGui.Enabled = not pwbGui.Enabled
+            else
+                pwbBuildGuiCreate()
+            end
+        end
+    end))
+end
+
+end -- close the do-block scoping the build subsystem
+
+-- [[ FLING (ported 1:1 from pealzware nanfling) ]]
+do
+-- Ported from pealzware.txt around lines 13414-13700. The shape and the
+-- _flingValues tables are preserved verbatim because the exact CFrame/angle
+-- cadence is what makes the technique land reliably.
+local _flingValues1 = {
+    { CFrame.new(0,  1.5,  0),     true  },
+    { CFrame.new(0, -1.5,  0),     true  },
+    { CFrame.new( 2.25,  1.5, -2.25), true  },
+    { CFrame.new(-2.25, -1.5,  2.25), true  },
+    { CFrame.new(0,  1.5,  0),     false },
+    { CFrame.new(0, -1.5,  0),     false },
+}
+local _flingValues2 = {
+    {  1.5, 1, CFrame.Angles(math.rad(90),  0, 0) },
+    { -1.5, 1, CFrame.Angles(0,             0, 0) },
+    {  1.5, 1, CFrame.Angles(math.rad(90),  0, 0) },
+    {  1.5, 2, CFrame.Angles(math.rad(90),  0, 0) },
+    { -1.5, 2, CFrame.Angles(0,             0, 0) },
+    {  1.5, 2, CFrame.Angles(math.rad(90),  0, 0) },
+    { -1.5, 3, CFrame.Angles(math.rad(90),  0, 0) },
+    { -1.5, 3, CFrame.Angles(0,             0, 0) },
+    { -1.5, 3, CFrame.Angles(math.rad(-90), 0, 0) },
+    { -1.5, 3, CFrame.Angles(0,             0, 0) },
+}
+
+local function _getFlingState(targetPlayer)
+    local targetChar = targetPlayer and targetPlayer.Character
+    if not targetChar then return nil end
+
+    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+    if not targetHum or targetHum.Health <= 0 then return nil end
+
+    local targetRoot = targetChar:FindFirstChild("HumanoidRootPart")
+        or targetChar:FindFirstChild("UpperTorso")
+        or targetChar:FindFirstChild("Torso")
+        or targetChar.PrimaryPart
+    if not targetRoot or not targetRoot:IsA("BasePart") then return nil end
+
+    return targetChar, targetHum, targetRoot
+end
+
+local function _cleanupFlingCharacter(character, humanoid, previousCollide, savedPivot, savedAutoRotate)
+    for _, mover in ipairs(character and character:GetDescendants() or {}) do
+        if mover:IsA("BodyVelocity") and mover.Name == "PWFlingDrive" then
+            pcall(function() mover:Destroy() end)
+        elseif mover:IsA("BodyAngularVelocity") and (mover.Name == "PWFlingSpin" or mover.Name == "PWSelfFlingSpin") then
+            pcall(function() mover:Destroy() end)
+        end
+    end
+
+    for part, canCollide in pairs(previousCollide or {}) do
+        if part and part.Parent then
+            pcall(function()
+                part.CanCollide = canCollide
+            end)
+        end
+    end
+
+    local _, _, root = _getFlingState(plr)
+    if root then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+
+    if humanoid and humanoid.Parent then
+        pcall(function()
+            humanoid.AutoRotate = savedAutoRotate
+            humanoid.PlatformStand = false
+        end)
+    end
+
+    if character and character.Parent and savedPivot then
+        pcall(function()
+            character:PivotTo(savedPivot)
+        end)
+    end
+
+    _flingInProgress = false
+end
+
+local function _selfFlingBurst()
+    local myChar, myHum, myRoot = _getFlingState(plr)
+    if not myRoot then
+        return false, "Your character is not ready"
+    end
+
+    local cleanup = {}
+    local ok, err = pcall(function()
+        _flingInProgress = true
+        pcall(function() plr.SimulationRadius = math.huge end)
+        if myHum then
+            myHum.Sit = false
+            myHum.PlatformStand = false
+        end
+
+        local spin = Instance.new("BodyAngularVelocity")
+        spin.Name = "PWSelfFlingSpin"
+        spin.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+        spin.P = 1e9
+        spin.AngularVelocity = Vector3.new(45000, 45000, 45000)
+        spin.Parent = myRoot
+        table.insert(cleanup, spin)
+
+        local burst = Instance.new("BodyVelocity")
+        burst.Name = "PWFlingDrive"
+        burst.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+        burst.P = 1e9
+        burst.Velocity = myRoot.CFrame.LookVector * 320 + Vector3.new(0, 220, 0)
+        burst.Parent = myRoot
+        table.insert(cleanup, burst)
+
+        if myHum then
+            myHum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+
+        task.wait(0.22)
+    end)
+
+    for _, mover in ipairs(cleanup) do
+        pcall(function() mover:Destroy() end)
+    end
+    if myRoot and myRoot.Parent then
+        pcall(function()
+            myRoot.AssemblyLinearVelocity = Vector3.zero
+            myRoot.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+    _flingInProgress = false
+
+    return ok, err
+end
+
+local function _flingPlayerInstant(targetPlayer, vel)
+    if not targetPlayer then
+        return false, "No target selected"
+    end
+
+    if targetPlayer == plr then
+        return _selfFlingBurst()
+    end
+
+    local myChar, myHum, myRoot = _getFlingState(plr)
+    if not myRoot or not myHum then
+        return false, "Your character is not ready"
+    end
+
+    local tChar, tHum, tRoot = _getFlingState(targetPlayer)
+    if not tRoot or not tHum then
+        return false, targetPlayer.Name .. " is not available"
+    end
+
+    if myRoot.Velocity.Magnitude < 50 then
+        getgenv().OldPos = myRoot.CFrame
+    end
+
+    local savedFallHeight = workspace.FallenPartsDestroyHeight
+    local savedAutoRotate = myHum.AutoRotate
+    local previousCollide = {}
+
+    local tHead     = tChar:FindFirstChild("Head")
+    local tAcc      = tChar:FindFirstChildOfClass("Accessory")
+    local tHandle   = tAcc and tAcc:FindFirstChild("Handle")
+    local anchor    = tHead or tRoot or tHandle
+    if not anchor then return false, "Target is missing every limb" end
+
+    local _origCamSubject = workspace.CurrentCamera and workspace.CurrentCamera.CameraSubject
+    if tHead then
+        workspace.CurrentCamera.CameraSubject = tHead
+    elseif tHandle then
+        workspace.CurrentCamera.CameraSubject = tHandle
+    elseif tHum then
+        workspace.CurrentCamera.CameraSubject = tHum
+    end
+
+    local function setPos(basePart, posCF, angCF)
+        if not (myRoot and myRoot.Parent) then return end
+        myRoot.CFrame = CFrame.new(basePart.Position) * posCF * angCF
+        myRoot.AssemblyLinearVelocity  = vel or Vector3.new(9e7, 9e8, 9e7)
+        myRoot.AssemblyAngularVelocity = vel or Vector3.new(9e8, 9e8, 9e8)
+        pcall(function() myHum:Move(vel or Vector3.new(9e7, 9e8, 9e7)) end)
+        if sethiddenproperty then
+            pcall(function() sethiddenproperty(myRoot, "PhysicsRepRootPart", tRoot) end)
+        end
+    end
+
+    local ok, err = pcall(function()
+        _flingInProgress = true
+        pcall(function() plr.SimulationRadius = math.huge end)
+        workspace.FallenPartsDestroyHeight = 0/0
+
+        for _, part in ipairs(myChar:GetDescendants()) do
+            if part:IsA("BasePart") then
+                previousCollide[part] = part.CanCollide
+                part.CanCollide = true
+            end
+        end
+
+        myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+        myHum.PlatformStand = true
+        myHum.AutoRotate    = false
+
+        local bv = nil
+        if not vel then
+            bv = Instance.new("BodyVelocity")
+            bv.Name     = "PWFlingDrive"
+            bv.MaxForce = Vector3.new(1/0, 1/0, 1/0)
+            bv.Velocity = Vector3.new(9e8, 9e8, 9e8)
+            bv.Parent   = myRoot
+        end
+
+        local startedAt = tick()
+        local TIMEOUT   = 2
+        local angle     = 0
+        local loopN     = 0
+        while tick() - startedAt < TIMEOUT do
+            tChar, tHum, tRoot = _getFlingState(targetPlayer)
+            if not tRoot or not tHum then break end
+            local newAnchor = tHead and tHead.Parent and tHead or tRoot
+            if not newAnchor then break end
+
+            loopN = loopN + 1
+            if newAnchor.Velocity.Magnitude < 50 then
+                angle = angle + 100
+                local data = _flingValues1[(loopN % #_flingValues1) + 1]
+                local mag  = (data[2] and newAnchor.Velocity.Magnitude / 1.25) or 1
+                setPos(newAnchor, data[1] + tHum.MoveDirection * mag, CFrame.Angles(math.rad(angle), 0, 0))
+            else
+                local data = _flingValues2[(loopN % #_flingValues2) + 1]
+                local lateral = ((data[2] == 1 and tHum.WalkSpeed)
+                              or (data[2] == 2 and tRoot.Velocity.Magnitude / 1.25)
+                              or 0) * ((data[1] < 0 and -1) or 1)
+                setPos(newAnchor, CFrame.new(0, data[1], lateral), data[3])
+            end
+
+            if myHum.Health <= 0 then break end
+            RunService.Heartbeat:Wait()
+        end
+
+        if bv then pcall(function() bv:Destroy() end) end
+    end)
+
+    if workspace.CurrentCamera then
+        pcall(function() workspace.CurrentCamera.CameraSubject = _origCamSubject or myHum end)
+    end
+    workspace.FallenPartsDestroyHeight = savedFallHeight
+    pcall(function() myHum.PlatformStand = false end)
+    pcall(function() myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, true) end)
+
+    local revertStart = tick()
+    repeat
+        pcall(function()
+            myHum.PlatformStand = false
+            if getgenv().OldPos and myRoot and myRoot.Parent then
+                myRoot.CFrame = getgenv().OldPos * CFrame.new(0, 0.5, 0)
+            end
+            myHum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            for _, x in ipairs(myChar:GetChildren()) do
+                if x:IsA("BasePart") then
+                    x.Velocity, x.RotVelocity = Vector3.zero, Vector3.zero
+                end
+            end
+        end)
+    until (not myRoot)
+        or (not myRoot.Parent)
+        or (not getgenv().OldPos)
+        or (myRoot.Position - getgenv().OldPos.Position).Magnitude < 25
+        or (tick() - revertStart) > 3
+
+    _cleanupFlingCharacter(myChar, myHum, previousCollide, getgenv().OldPos, savedAutoRotate)
+    return ok, err
+end
+
+-- nanFling = .fling variant that yeets straight down (instant kill in most games).
+local function _nanFlingPlayer(targetPlayer)
+    return _flingPlayerInstant(targetPlayer, Vector3.new(0, -9e9, 0))
+end
+
+-- Lightweight player resolver for .fling targets. Bots and the owner are
+-- excluded from "all" by default — we don't want bots flinging each other or
+-- the controller account.
+local function isFlingProtected(target)
+    if not target then return true end
+    if target == LocalPlayer then return true end
+    if target.UserId == OWNER_USER_ID then return true end
+    if isBotPlayer(target) then return true end
+    return false
+end
+
+local function findPlayerByFlingQuery(query)
+    if not query or query == "" then return nil end
+    query = string.lower(tostring(query))
+
+    if query == "me" then return LocalPlayer end
+    if query == "owner" or query == "pea" or query == "0pealz" then return getOwnerPlayer() end
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if string.lower(p.Name) == query or string.lower(p.DisplayName) == query then
+            return p
+        end
+    end
+    for _, p in ipairs(Players:GetPlayers()) do
+        local n = string.lower(p.Name)
+        if string.sub(n, 1, #query) == query then return p end
+    end
+    return nil
+end
+
+local function resolveFlingTargets(arg)
+    arg = tostring(arg or ""):lower()
+
+    if arg == "all" or arg == "" then
+        local targets = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if not isFlingProtected(p) then
+                table.insert(targets, p)
+            end
+        end
+        return targets
+    end
+
+    if arg == "random" then
+        local pool = {}
+        for _, p in ipairs(Players:GetPlayers()) do
+            if not isFlingProtected(p) then
+                table.insert(pool, p)
+            end
+        end
+        if #pool == 0 then return {} end
+        return { pool[math.random(1, #pool)] }
+    end
+
+    local resolved = findPlayerByFlingQuery(arg)
+    if not resolved then return {} end
+    return { resolved }
+end
+
+runFling = function(arg, useNan)
+    if not isBot then return end
+    if _flingInProgress then return end
+
+    local targets = resolveFlingTargets(arg)
+    if #targets == 0 then
+        displayLocalMessage("Fling: no valid target.", Color3.fromRGB(220, 170, 80))
+        return
+    end
+
+    -- Stagger so a swarm doesn't pile onto the same victim at the same instant.
+    trackThread(task.spawn(function()
+        task.wait(getLocalBotStagger and getLocalBotStagger(1.5) or 0)
+        for _, target in ipairs(targets) do
+            if not Controller.running then return end
+            if isFlingProtected(target) then continue end
+            local fn = useNan and _nanFlingPlayer or _flingPlayerInstant
+            local ok, err = fn(target)
+            if not ok and err then
+                displayLocalMessage("Fling " .. target.Name .. " failed: " .. tostring(err):sub(1, 60), Color3.fromRGB(220, 170, 80))
+            end
+            task.wait(0.6)
+        end
+    end))
+end
+
+end -- close the do-block scoping the fling subsystem
+
+-- [[ COMMANDS ]]
+local partyEmotes = {
+    "/e dance",
+    "/e dance2",
+    "/e dance3",
+    "/e cheer",
+    "/e wave",
+    "/e laugh",
+    "/e point",
+}
+
+local cheerTemplates = {
+    "lets go %s",
+    "big W %s",
+    "%s is cooking",
+    "gg %s",
+    "%s got this",
+}
+
+-- `.cmds` shows NAMES ONLY (no descriptions), per request. Ordered roughly by
+-- category: formations, then emotes/actions, then utility. The auto-build is
+-- intentionally absent — it lives entirely in the owner GUI now, not as a
+-- typed command.
+local commandNames = {
+    -- formations / shapes
+    ".follow", ".line", ".circle", ".orbit", ".square", ".grid", ".triangle",
+    ".diamond", ".cross", ".wedge", ".arc", ".wall", ".pyramid", ".zigzag",
+    ".star", ".spiral", ".heart", ".tower", ".scatter", ".normal",
+    -- emotes / actions
+    ".party", ".wave", ".laugh", ".point", ".jump", ".spin", ".cheer",
+    -- movement / session
+    ".rejoin", ".reset", ".noclip", ".clip", ".menoclip", ".meclip", ".donate", ".say",
+    ".hide", ".unhide", ".fling", ".nanfling",
+    -- utility
+    ".bots", ".bus", ".unload", ".cmds",
+}
+
+math.randomseed((os.time() + LocalPlayer.UserId) % 2147483647)
+
+getLocalBotStagger = function(maxDelay)
+    local roster = getBotRoster()
+    local index = getLocalBotIndex(roster) or 1
+    return math.min(maxDelay or 2, (index - 1) * 0.2) + math.random() * 0.25
+end
+
+local function queueStaggeredChat(message, priority)
+    trackThread(task.spawn(function()
+        task.wait(getLocalBotStagger(2.2))
+        queueChat(message, priority)
+    end))
+end
+
+local function runParty()
+    setNormalMode()
+    state.mode = "party"
+    state.partying = true
+    state.partyToken = state.partyToken + 1
+
+    local token = state.partyToken
+
+    trackThread(task.spawn(function()
+        task.wait(getLocalBotStagger(3))
+
+        while Controller.running and state.partying and state.partyToken == token do
+            local roster = getBotRoster()
+            local index = getLocalBotIndex(roster) or 1
+            local emoteIndex = ((math.random(1, #partyEmotes) + index + math.floor(os.clock())) % #partyEmotes) + 1
+            queueChat(partyEmotes[emoteIndex])
+            task.wait(math.random(40, 85) / 10 + ((index % 3) * 0.35))
+        end
+    end))
+end
+
+local function runEmote(emote)
+    queueStaggeredChat(emote, true)
+end
+
+local function runJump()
+    trackThread(task.spawn(function()
+        task.wait(getLocalBotStagger(1.8))
+
+        local humanoid = getHumanoid(LocalPlayer)
+        if humanoid and humanoid.Health > 0 then
+            pcall(function()
+                humanoid.Sit = false
+                humanoid.Jump = true
+            end)
+        end
+    end))
+end
+
+local function runCheer(target)
+    local now = os.clock()
+    if now - state.lastCheerAt < 10 then
+        return
+    end
+
+    state.lastCheerAt = now
+    target = tostring(target or OWNER_DISPLAY_NAME)
+    target = string.gsub(target, "[\r\n]", "")
+    target = string.sub(target, 1, 24)
+
+    local template = cheerTemplates[math.random(1, #cheerTemplates)]
+    queueChat(string.format(template, target))
+end
+
+local function rejoinServer()
+    setNormalMode()
+    displayLocalMessage("Rejoining server...")
+
+    trackThread(task.spawn(function()
+        task.wait(0.25)
+
+        local rejoined = false
+
+        if tostring(game.JobId or "") ~= "" then
+            rejoined = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end)
+        end
+
+        if not rejoined then
+            pcall(function()
+                TeleportService:Teleport(game.PlaceId, LocalPlayer)
+            end)
+        end
+    end))
+end
+
+local function resetLocalCharacter()
+    setNormalMode()
+    state.resetting = true
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if humanoid then
+        pcall(function()
+            humanoid.Health = 0
+            humanoid:ChangeState(Enum.HumanoidStateType.Dead)
+        end)
+    elseif character then
+        pcall(function()
+            character:BreakJoints()
+        end)
+    end
+
+    trackThread(task.delay(5, function()
+        state.resetting = false
+    end))
+end
+
+local function describeBotRoster()
+    local roster = getBotRoster()
+    local names = {}
+
+    for _, player in ipairs(roster) do
+        table.insert(names, player.Name)
+    end
+
+    if #names == 0 then
+        return "Detected bots: 0"
+    end
+
+    return "Detected bots (" .. tostring(#names) .. "): " .. table.concat(names, ", ")
+end
+
+local function describeCommands()
+    -- Names only, space-separated — no descriptions.
+    return table.concat(commandNames, " ")
+end
+
+local function describeCommandBus()
+    if not hasCommandBus() then
+        return "Command bus: unavailable (readfile/writefile missing)"
+    end
+
+    return "Command bus: active via " .. COMMAND_BUS_FILE
+end
+
+-- hasCommandBus forward-declared above so the build subsystem can reference it.
+hasCommandBus = function()
+    return type(readfile) == "function" and type(writefile) == "function"
+end
+
+local function makeCommandBusId(message)
+    return tostring(OWNER_USER_ID)
+        .. ":"
+        .. tostring(LocalPlayer.UserId)
+        .. ":"
+        .. tostring(math.floor(os.clock() * 1000))
+        .. ":"
+        .. tostring(#tostring(message or ""))
+end
+
+publishCommandToBus = function(message, fromBus)
+    if fromBus or not hasCommandBus() then
+        return
+    end
+
+    message = tostring(message or "")
+    local now = os.clock()
+    if state.lastBusPublishAt[message] and now - state.lastBusPublishAt[message] < 1.5 then
+        return
+    end
+
+    local commandId = makeCommandBusId(message)
+    state.lastBusPublishAt[message] = now
+    state.seenBusIds[commandId] = true
+
+    pcall(function()
+        writefile(COMMAND_BUS_FILE, HttpService:JSONEncode({
+            id = commandId,
+            from = LocalPlayer.UserId,
+            owner = OWNER_USER_ID,
+            command = message,
+            time = os.time(),
+        }))
+    end)
+end
+
+local function startCommandBusPoller()
+    if not hasCommandBus() then
+        return
+    end
+
+    local initialOk, initialRaw = pcall(readfile, COMMAND_BUS_FILE)
+    if initialOk and type(initialRaw) == "string" and initialRaw ~= "" then
+        local initialDecodedOk, initialData = pcall(function()
+            return HttpService:JSONDecode(initialRaw)
+        end)
+
+        if initialDecodedOk and type(initialData) == "table" and type(initialData.id) == "string" then
+            state.seenBusIds[initialData.id] = true
+        end
+    end
+
+    trackThread(task.spawn(function()
+        while Controller.running do
+            local ok, raw = pcall(readfile, COMMAND_BUS_FILE)
+            if ok and type(raw) == "string" and raw ~= "" then
+                local decodedOk, data = pcall(function()
+                    return HttpService:JSONDecode(raw)
+                end)
+
+                if decodedOk
+                    and type(data) == "table"
+                    and data.owner == OWNER_USER_ID
+                    and type(data.id) == "string"
+                    and type(data.command) == "string"
+                    and not state.seenBusIds[data.id]
+                then
+                    state.seenBusIds[data.id] = true
+                    processCommand(OWNER_USER_ID, data.command, true)
+                end
+            end
+
+            task.wait(COMMAND_BUS_POLL_INTERVAL)
+        end
+    end))
+end
+
+getHttpRequestFunction = function()
+    local requestFunction = (syn and syn.request)
+        or (http and http.request)
+        or (fluxus and fluxus.request)
+        or request
+        or http_request
+
+    if requestFunction then
+        return requestFunction
+    end
+
+    return function(options)
+        return HttpService:RequestAsync(options)
+    end
+end
+
+local function remoteBotId()
+    return tostring(LocalPlayer.UserId)
+end
+
+local function remoteLog(level, message)
+    if not REMOTE_CONTROL_ENABLED or not isBot then
+        return
+    end
+
+    task.spawn(function()
+        remoteRequest("log", {
+            botId = remoteBotId(),
+            level = level,
+            message = message,
+        })
+    end)
+end
+
+local function buildHeartbeatPayload()
+    local roster = getBotRoster()
+    local botIndex = getLocalBotIndex(roster)
+    local ping = nil
+
+    pcall(function()
+        ping = math.floor(LocalPlayer:GetNetworkPing() * 1000)
+    end)
+
+    return {
+        id = remoteBotId(),
+        userId = LocalPlayer.UserId,
+        username = LocalPlayer.Name,
+        displayName = LocalPlayer.DisplayName,
+        accountAge = LocalPlayer.AccountAge,
+        placeId = tostring(game.PlaceId),
+        jobId = tostring(game.JobId),
+        mode = state.mode,
+        hiddenDonations = state.hiddenDonations,
+        timeStat = getTimeStatValue(),
+        ping = ping,
+        botIndex = botIndex,
+        botCount = #roster,
+        version = SCRIPT_VERSION,
+    }
+end
+
+local function startRemoteControl()
+    if not REMOTE_CONTROL_ENABLED or not isBot then
+        return
+    end
+
+    trackThread(task.spawn(function()
+        remoteLog("load", "bot controller loaded")
+
+        while Controller.running do
+            remoteRequest("heartbeat", buildHeartbeatPayload())
+            task.wait(REMOTE_HEARTBEAT_INTERVAL)
+        end
+    end))
+
+    trackThread(task.spawn(function()
+        while Controller.running do
+            local payload = {
+                id = remoteBotId(),
+                userId = LocalPlayer.UserId,
+            }
+
+            if state.remoteSynced then
+                payload.lastSeq = state.remoteLastSeq or 0
+            end
+
+            local data = remoteRequest("poll", payload)
+
+            if type(data) == "table" and data.ok ~= false then
+                if not state.remoteSynced then
+                    state.remoteSynced = true
+                    state.remoteLastSeq = tonumber(data.seq) or 0
+                elseif type(data.command) == "table" then
+                    local commandSeq = tonumber(data.command.seq)
+                    local commandText = tostring(data.command.text or "")
+
+                    if commandSeq and commandText ~= "" and commandSeq > (state.remoteLastSeq or 0) then
+                        state.remoteLastSeq = commandSeq
+                        remoteLog("command", "executing " .. commandText)
+                        processCommand(OWNER_USER_ID, commandText, true)
+                    end
+                elseif tonumber(data.seq) then
+                    state.remoteLastSeq = math.max(state.remoteLastSeq or 0, tonumber(data.seq))
+                end
+            end
+
+            task.wait(REMOTE_POLL_INTERVAL)
+        end
+    end))
+end
+
+processCommand = function(speaker, message, fromBus)
+    local speakerUserId = getSpeakerUserId(speaker)
+
+    if not isOwnerSpeaker(speaker) and not fromBus then
+        return
+    end
+
+    message = tostring(message or "")
+    local commandPrefix = getCommandPrefix(message)
+    if not commandPrefix then
+        return
+    end
+
+    local dedupeKey = tostring(speakerUserId or OWNER_USER_ID) .. ":" .. message
+    local now = os.clock()
+    if state.lastCommandAt[dedupeKey] and now - state.lastCommandAt[dedupeKey] < 0.75 then
+        return
+    end
+    state.lastCommandAt[dedupeKey] = now
+
+    local args = splitCommand(message)
+    local command = string.lower(string.sub(args[1] or "", #commandPrefix + 1))
+    local canRunOnOwnerClient = command == "cmds"
+        or command == "commands"
+        or command == "bots"
+        or command == "botlist"
+        or command == "bus"
+        or command == "build"
+        or command == "menoclip"
+        or command == "selfnoclip"
+        or command == "meclip"
+        or command == "unmenoclip"
+
+    publishCommandToBus(message, fromBus)
+    publishCommandToRemote(message, fromBus)
+
+    if not isBot and not canRunOnOwnerClient then
+        return
+    end
+
+    if command == "follow" then
+        setNormalMode()
+        state.mode = "follow"
+        -- Walking follow is driven entirely by the Heartbeat loop (walkFollow);
+        -- no weld constraints to build.
+        if isBot then
+            resetFollowTracker()
+        end
+    elseif command == "unfollow" or command == "stop" or command == "idle" or command == "normal" then
+        setNormalMode()
+    elseif command == "line" then
+        setNormalMode()
+        state.mode = "line"
+        state.spacing = clampNumber(args[2], DEFAULT_LINE_SPACING, 2, 20)
+        state.lineDistance = clampNumber(args[3], DEFAULT_LINE_DISTANCE, 4, 40)
+    elseif command == "circle" then
+        setNormalMode()
+        state.mode = "circle"
+        state.circleRadius = clampNumber(args[2], DEFAULT_CIRCLE_RADIUS, 4, 45)
+    elseif command == "orbit" then
+        setNormalMode()
+        state.mode = "orbit"
+        state.orbitRadius = clampNumber(args[2], DEFAULT_ORBIT_RADIUS, 5, 50)
+        state.orbitSpeed = clampNumber(args[3], DEFAULT_ORBIT_SPEED, 0.25, 6)
+    elseif command == "tower" then
+        setNormalMode()
+        state.mode = "tower"
+        state.towerSpacing = clampNumber(args[2], DEFAULT_TOWER_SPACING, 3, 8)
+        state.towerDistance = clampNumber(args[3], DEFAULT_TOWER_DISTANCE, 3, 25)
+    elseif command == "scatter" or command == "spread" then
+        setNormalMode()
+        state.mode = "scatter"
+        state.scatterRadius = clampNumber(args[2], DEFAULT_SCATTER_RADIUS, 7, 60)
+    elseif command == "square" or command == "diamond"
+        or command == "cross" or command == "plus" or command == "arc"
+        or command == "star" or command == "spiral" or command == "heart" then
+        -- Ring-style shapes: arg2 = radius, arg3 = spacing.
+        setNormalMode()
+        state.mode = (command == "plus") and "cross" or command
+        state.shapeRadius = clampNumber(args[2], DEFAULT_SHAPE_RADIUS, 4, 80)
+        state.shapeSpacing = clampNumber(args[3], DEFAULT_SHAPE_SPACING, 2, 20)
+    elseif command == "grid" or command == "wall" or command == "triangle"
+        or command == "pyramid" or command == "wedge" or command == "v"
+        or command == "zigzag" then
+        -- Pattern-style shapes: arg2 = spacing, arg3 = distance in front.
+        setNormalMode()
+        state.mode = (command == "v") and "wedge" or command
+        state.shapeSpacing = clampNumber(args[2], DEFAULT_SHAPE_SPACING, 2, 20)
+        state.shapeDistance = clampNumber(args[3], DEFAULT_SHAPE_DISTANCE, 3, 40)
+    elseif command == "party" then
+        runParty()
+    elseif command == "wave" then
+        runEmote("/e wave")
+    elseif command == "laugh" then
+        runEmote("/e laugh")
+    elseif command == "point" then
+        runEmote("/e point")
+    elseif command == "jump" or command == "hop" then
+        runJump()
+    elseif command == "spin" then
+        state.spinUntil = os.clock() + clampNumber(args[2], 5, 1, 30)
+    elseif command == "rejoin" or command == "rj" then
+        rejoinServer()
+    elseif command == "reset" or command == "respawn" then
+        resetLocalCharacter()
+    elseif command == "donate" then
+        local amount = tonumber(args[2]) or getTimeStatValue()
+        if donateTime(amount, true) then
+            displayLocalMessage("Donate sent: " .. tostring(math.floor(tonumber(amount) or 0)))
+        else
+            displayLocalMessage("Donate skipped: no Time stat found.", Color3.fromRGB(220, 170, 80))
+        end
+    elseif command == "noclip" then
+        state.noclip = true
+        applyNoclip()
+        displayLocalMessage("Noclip enabled.")
+    elseif command == "clip" or command == "unnoclip" then
+        state.noclip = false
+        restoreNoclipCollisions()
+        displayLocalMessage("Noclip disabled.")
+    elseif command == "menoclip" or command == "selfnoclip" then
+        -- Owner-only: noclip 0pealz's own character (not the bots).
+        if isOwnerAccount then
+            state.selfNoclip = true
+            applyNoclip()
+            displayLocalMessage("Self-noclip enabled (0pealz only).")
+        end
+    elseif command == "meclip" or command == "unmenoclip" then
+        if isOwnerAccount then
+            state.selfNoclip = false
+            restoreNoclipCollisions()
+            displayLocalMessage("Self-noclip disabled.")
+        end
+    elseif command == "unload" then
+        displayLocalMessage("Unloading bot controller.")
+        remoteLog("unload", "controller unloaded by command")
+        Controller.stop()
+    elseif command == "cheer" then
+        runCheer(args[2])
+    elseif command == "bots" or command == "botlist" then
+        displayLocalMessage(describeBotRoster())
+    elseif command == "bus" then
+        displayLocalMessage(describeCommandBus())
+    elseif command == "cmds" or command == "commands" then
+        displayLocalMessage(describeCommands())
+    elseif command == "hide" then
+        state.hiddenDonations = true
+        displayLocalMessage("Hidden donate mode enabled. Auto-donate will send ;donate.")
+    elseif command == "unhide" then
+        state.hiddenDonations = false
+        displayLocalMessage("Hidden donate mode disabled. Auto-donate will send donate.")
+    elseif command == "say" then
+        local sayText = string.match(message, "^%S+%s+(.+)$")
+        if sayText then
+            queueChat(sayText, true)
+        end
+    elseif command == "fling" then
+        runFling(args[2], false)
+    elseif command == "nanfling" or command == "nan" then
+        runFling(args[2], true)
+    elseif command == "build" then
+        local sub = string.lower(args[2] or "")
+        if sub == "start" then
+            pwbRunBuildSlice(args[3])
+        elseif sub == "stop" or sub == "cancel" then
+            pwbStopBuild()
+            if not fromBus then
+                displayLocalMessage("Build stopped.")
+            end
+        elseif sub == "status" then
+            local c, t, b = pwbAggregateProgress()
+            displayLocalMessage(string.format("Build: %d / %d across %d bots.", c, t, b))
+        elseif sub == "panel" or sub == "gui" or sub == "" then
+            if isOwnerAccount then
+                if pwbGui and pwbGui.Parent then
+                    pwbGui.Enabled = not pwbGui.Enabled
+                else
+                    pwbBuildGuiCreate()
+                end
+            end
+        end
+    elseif command == "hate" or command == "grief" or command == "griefaura" then
+        displayLocalMessage("That command is blocked in this controller.", Color3.fromRGB(220, 80, 80))
+    end
+end
+
+startCommandBusPoller()
+startRemoteControl()
+
+local hookedPlayers = {}
+
+local function hookPlayer(player)
+    if hookedPlayers[player] then
+        return
+    end
+
+    hookedPlayers[player] = true
+
+    track(player.Chatted:Connect(function(message)
+        processCommand(player, message)
+    end))
+end
+
+for _, player in ipairs(Players:GetPlayers()) do
+    hookPlayer(player)
+end
+
+track(Players.PlayerAdded:Connect(hookPlayer))
+
+if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+    local hookedChannels = {}
+
+    local function handleIncomingTextMessage(incomingMessage)
+        if not incomingMessage then
+            return
+        end
+
+        local statusOk = incomingMessage.Status == nil
+            or incomingMessage.Status == Enum.TextChatMessageStatus.Success
+        if not statusOk then
+            return
+        end
+
+        local source = incomingMessage.TextSource
+        local speaker = source and (Players:GetPlayerByUserId(source.UserId) or source.UserId)
+
+        if speaker then
+            processCommand(speaker, incomingMessage.Text)
+        end
+    end
+
+    local function hookTextChannel(channel)
+        if not channel or hookedChannels[channel] then
+            return
+        end
+
+        hookedChannels[channel] = true
+
+        pcall(function()
+            track(channel.MessageReceived:Connect(handleIncomingTextMessage))
+        end)
+    end
+
+    Controller.incomingMessageHandler = function(incomingMessage)
+        handleIncomingTextMessage(incomingMessage)
+        return nil
+    end
+
+    pcall(function()
+        TextChatService.OnIncomingMessage = Controller.incomingMessageHandler
+    end)
+
+    pcall(function()
+        track(TextChatService.MessageReceived:Connect(handleIncomingTextMessage))
+    end)
+
+    local textChannels = getTextChannels(10)
+    if textChannels then
+        for _, channel in ipairs(textChannels:GetChildren()) do
+            hookTextChannel(channel)
+        end
+
+        track(textChannels.ChildAdded:Connect(function(channel)
+            task.defer(hookTextChannel, channel)
+        end))
+    end
+else
+    local chatEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    local onMessageDoneFiltering = chatEvents and chatEvents:FindFirstChild("OnMessageDoneFiltering")
+
+    if onMessageDoneFiltering then
+        track(onMessageDoneFiltering.OnClientEvent:Connect(function(messageData)
+            local speakerName = messageData and messageData.FromSpeaker
+            local speaker = speakerName and Players:FindFirstChild(speakerName)
+
+            if speaker then
+                processCommand(speaker, messageData.Message)
+            end
+        end))
+    end
+end
+
+-- [[ ANTI-AFK ]]
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local function sendAntiAfkInput()
+    pcall(function()
+        VirtualUser:CaptureController()
+    end)
+
+    pcall(function()
+        VirtualUser:ClickButton2(Vector2.new(math.random(1, 8), math.random(1, 8)))
+    end)
+
+    if VirtualInputManager then
+        pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+            task.wait(0.05)
+            VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+        end)
+    end
+end
+
+local function nudgeCharacterForAfk()
+    if not isBot then
+        return
+    end
+
+    local character = LocalPlayer.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+
+    if not humanoid or humanoid.Health <= 0 then
+        return
+    end
+
+    pcall(function()
+        humanoid.Sit = false
+        humanoid.PlatformStand = false
+    end)
+
+    if state.mode == "idle" then
+        pcall(function()
+            humanoid.Jump = true
+        end)
+    elseif root then
+        pcall(function()
+            root.AssemblyLinearVelocity = root.AssemblyLinearVelocity + Vector3.new(0, 0.01, 0)
+        end)
+    end
+end
+
+track(LocalPlayer.Idled:Connect(function()
+    sendAntiAfkInput()
+end))
+
+if ENABLE_AGGRESSIVE_ANTI_AFK then
+    trackThread(task.spawn(function()
+        local lastNudgeAt = os.clock()
+
+        while Controller.running do
+            sendAntiAfkInput()
+
+            local now = os.clock()
+            if now - lastNudgeAt >= ANTI_AFK_CHARACTER_NUDGE_INTERVAL then
+                lastNudgeAt = now
+                nudgeCharacterForAfk()
+            end
+
+            task.wait(ANTI_AFK_INPUT_INTERVAL)
+        end
+    end))
+end
+
+-- Keep this after the TextChat hook so the local notice uses the same channel when possible.
+displayLocalMessage(isBot and "Bot controller loaded." or "Controller loaded on non-bot account.")
